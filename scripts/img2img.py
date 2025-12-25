@@ -126,7 +126,7 @@ def save_heatmap_with_correlation(uncertainty_tensor, error_tensor, output_dir, 
 
 def create_retransmission_mask(uncertainty_map, rate):
     """
-    不確実性マップから上位 rate% の領域を特定するマスクを作成
+    不確実性マップから上位 rate% (不確実性が高い領域) を特定するマスクを作成
     """
     if uncertainty_map is None:
         return None
@@ -141,6 +141,29 @@ def create_retransmission_mask(uncertainty_map, rate):
         if k > 0:
             threshold = torch.kthvalue(flat, flat.numel() - k + 1).values
             mask[i] = (spatial_unc[i] >= threshold).float()
+            
+    return mask
+
+def create_low_uncertainty_mask(uncertainty_map, rate):
+    """
+    不確実性マップから下位 rate% (不確実性が低い領域) を特定するマスクを作成
+    比較実験用
+    """
+    if uncertainty_map is None:
+        return None
+    
+    spatial_unc = torch.mean(uncertainty_map, dim=1, keepdim=True)
+    b, c, h, w = spatial_unc.shape
+    mask = torch.zeros_like(spatial_unc)
+    
+    for i in range(b):
+        flat = spatial_unc[i].flatten()
+        k = int(flat.numel() * rate)
+        if k > 0:
+            # 下位k番目の値（小さい順）を閾値とする
+            threshold = torch.kthvalue(flat, k).values
+            # 閾値以下（不確実性が低い）をマスク対象とする
+            mask[i] = (spatial_unc[i] <= threshold).float()
             
     return mask
 
@@ -229,10 +252,8 @@ def main():
     # 結果保存用変数
     all_results = {}
     
-    # --- 修正箇所: ファイル名にパラメータを含める ---
     json_filename = f"metrics_snr{args.snr}dB_rate{args.retransmission_rate}.json"
     json_path = os.path.join(experiment_dir, json_filename)
-    # ----------------------------------------
 
     # JSON保存用ヘルパー関数
     class NumpyEncoder(json.JSONEncoder):
@@ -325,14 +346,14 @@ def main():
                 )
                 print(f"  [Pass 1] Uncertainty-Error Correlation: {sum(corrs_pass1)/len(corrs_pass1):.4f}")
 
-                # === Retransmission Logic (Proposed: Uncertainty) ===
+                # === Retransmission Logic (Method 1: High Uncertainty) ===
                 pass2_unc_results = {}
                 if args.retransmission_rate > 0.0 and uncertainty_map is not None:
-                    print(f"  [Retransmission - Uncertainty] Rate={args.retransmission_rate*100}%")
+                    print(f"  [Retransmission - High Uncertainty] Rate={args.retransmission_rate*100}%")
                     mask_unc = create_retransmission_mask(uncertainty_map, args.retransmission_rate)
                     
                     # Save Masks (Slicing)
-                    print("  Saving Uncertainty Mask images...")
+                    print("  Saving High Uncertainty Mask images...")
                     valid_mask_unc = mask_unc[:actual_bs]
                     mask_unc_np = valid_mask_unc.cpu().permute(0, 2, 3, 1).numpy()
                     for j, fname in enumerate(batch_files):
@@ -359,6 +380,43 @@ def main():
                     
                     pass2_unc_results = evaluate_and_save(
                         valid_x_rec_unc, valid_batch_input, batch_files, batch_out_dir, "pass2_unc",
+                        loss_fn_lpips, loss_fn_dists, loss_fn_id
+                    )
+
+                # === Retransmission Logic (Method 2: Low Uncertainty [Comparison]) ===
+                pass2_low_unc_results = {}
+                if args.retransmission_rate > 0.0 and uncertainty_map is not None:
+                    print(f"  [Retransmission - Low Uncertainty] Rate={args.retransmission_rate*100}%")
+                    mask_low_unc = create_low_uncertainty_mask(uncertainty_map, args.retransmission_rate)
+                    
+                    # Save Masks (Slicing)
+                    print("  Saving Low Uncertainty Mask images...")
+                    valid_mask_low_unc = mask_low_unc[:actual_bs]
+                    mask_low_unc_np = valid_mask_low_unc.cpu().permute(0, 2, 3, 1).numpy()
+                    for j, fname in enumerate(batch_files):
+                        fname_no_ext = os.path.splitext(fname)[0]
+                        save_name = f"{fname_no_ext}_mask_low_unc.png"
+                        save_path = os.path.join(batch_out_dir, str(j), save_name)
+                        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                        mask_img_data = (mask_low_unc_np[j].squeeze() * 255).astype(np.uint8)
+                        Image.fromarray(mask_img_data, mode='L').save(save_path)
+
+                    # Sample Inpainting (Full Batch)
+                    samples_low_unc, _ = sampler.sample_inpainting_awgn(
+                        S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:],
+                        noisy_latent=z_received_pass1,
+                        snr_db=args.snr,
+                        mask=mask_low_unc,
+                        x0=z0,
+                        eta=0.0, verbose=True
+                    )
+                    
+                    # Decode & Evaluate (Slicing)
+                    x_rec_low_unc = model.decode_first_stage(samples_low_unc)
+                    valid_x_rec_low_unc = x_rec_low_unc[:actual_bs]
+                    
+                    pass2_low_unc_results = evaluate_and_save(
+                        valid_x_rec_low_unc, valid_batch_input, batch_files, batch_out_dir, "pass2_low_unc",
                         loss_fn_lpips, loss_fn_dists, loss_fn_id
                     )
 
@@ -410,6 +468,9 @@ def main():
                         "pass2_uncertainty": {
                             "metrics": pass2_unc_results.get(fname) if pass2_unc_results else None
                         },
+                        "pass2_low_uncertainty": {
+                            "metrics": pass2_low_unc_results.get(fname) if pass2_low_unc_results else None
+                        },
                         "pass2_random": {
                             "metrics": pass2_rand_results.get(fname) if pass2_rand_results else None
                         }
@@ -427,6 +488,11 @@ def main():
                 if 'mask_unc' in locals(): del mask_unc
                 if 'pass2_unc_results' in locals(): del pass2_unc_results
                 
+                if 'samples_low_unc' in locals(): del samples_low_unc
+                if 'x_rec_low_unc' in locals(): del x_rec_low_unc
+                if 'mask_low_unc' in locals(): del mask_low_unc
+                if 'pass2_low_unc_results' in locals(): del pass2_low_unc_results
+
                 if 'samples_rand' in locals(): del samples_rand
                 if 'x_rec_rand' in locals(): del x_rec_rand
                 if 'mask_rand' in locals(): del mask_rand
@@ -438,6 +504,90 @@ def main():
                 
                 gc.collect() # Pythonオブジェクトの参照を切る
                 torch.cuda.empty_cache() # GPUメモリを解放する
+
+        # === 最終集計とレポート出力 ===
+        # 計算対象のメソッド名と表示名
+        method_labels = {
+            "pass1": "Pass 1 (Initial)",
+            "pass2_uncertainty": "Pass 2 (High Uncertainty)",
+            "pass2_low_uncertainty": "Pass 2 (Low Uncertainty)",
+            "pass2_random": "Pass 2 (Random)"
+        }
+        metric_keys = ["psnr", "lpips", "dists", "id_loss"]
+
+        # 集計用辞書
+        aggregated_metrics = {m_key: {met: [] for met in metric_keys} for m_key in method_labels}
+
+        # all_results からデータを収集
+        for fname, res in all_results.items():
+            for m_key in method_labels:
+                if res.get(m_key) and res[m_key].get("metrics"):
+                    metrics_dict = res[m_key]["metrics"]
+                    for met in metric_keys:
+                        if met in metrics_dict:
+                            aggregated_metrics[m_key][met].append(metrics_dict[met])
+
+        # 平均の計算
+        averages = {m_key: {} for m_key in method_labels}
+        for m_key in method_labels:
+            for met in metric_keys:
+                vals = aggregated_metrics[m_key][met]
+                if len(vals) > 0:
+                    averages[m_key][met] = sum(vals) / len(vals)
+                else:
+                    averages[m_key][met] = None
+
+        # ベストスコアの特定 (PSNRは最大、それ以外は最小)
+        best_scores = {}
+        for met in metric_keys:
+            valid_avgs = [averages[m][met] for m in method_labels if averages[m][met] is not None]
+            if not valid_avgs:
+                continue
+            
+            if met == "psnr":
+                best_scores[met] = max(valid_avgs)
+            else:
+                best_scores[met] = min(valid_avgs)
+
+        # テーブル出力 (カラーコード付き)
+        GREEN = "\033[92m"
+        RESET = "\033[0m"
+        BOLD = "\033[1m"
+
+        print("\n" + "="*85)
+        print(f"  SIMULATION SUMMARY: Average Metrics (N={len(all_results)})")
+        print("="*85)
+        
+        # ヘッダー
+        header = f"{'Method':<30} | {'PSNR':<12} | {'LPIPS':<12} | {'DISTS':<12} | {'ID Loss':<12}"
+        print(header)
+        print("-" * 85)
+
+        for m_key, m_name in method_labels.items():
+            row_str = f"{m_name:<30}"
+            
+            for met in metric_keys:
+                val = averages[m_key].get(met)
+                if val is None:
+                    row_str += f" | {'N/A':<12}"
+                    continue
+                
+                # フォーマット
+                val_str = f"{val:.4f}"
+                
+                # ベストスコア判定
+                is_best = False
+                if met in best_scores and abs(val - best_scores[met]) < 1e-9:
+                    is_best = True
+                
+                if is_best:
+                    # 緑色太字で強調 + アスタリスク
+                    row_str += f" | {GREEN}{BOLD}*{val_str}* {RESET}"
+                else:
+                    row_str += f" | {val_str:<12}"
+            
+            print(row_str)
+        print("-" * 85 + "\n")
 
     except KeyboardInterrupt:
         print("\n\n!!! Simulation Interrupted by User !!!")
@@ -452,7 +602,7 @@ def main():
         save_all_results()
         raise e
 
-    print("\nSimulation Finished.")
+    print("Simulation Finished.")
 
 if __name__ == "__main__":
     main()
