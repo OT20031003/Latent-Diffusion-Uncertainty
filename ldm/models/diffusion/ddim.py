@@ -278,12 +278,9 @@ class DDIMSampler(object):
         size = (batch_size, C, H, W)
         samples = x_start
         
-        # === 高速化: オンライン分散計算用の変数を初期化 ===
-        # 履歴リスト(pred_x0_history)は廃止し、和と二乗和のみを保持します
         sum_pred_x0 = torch.zeros(size, device=self.model.device)
         sum_sq_pred_x0 = torch.zeros(size, device=self.model.device)
         step_count = 0
-        # ============================================
 
         iterator = tqdm(timesteps[start_idx:], desc='AWGN Denoising', total=len(timesteps)-start_idx) if verbose else timesteps[start_idx:]
 
@@ -298,29 +295,99 @@ class DDIMSampler(object):
                                       unconditional_guidance_scale=unconditional_guidance_scale)
             samples, pred_x0 = outs
             
-            # === 高速化: GPU上で累積加算 (CPUへの転送なし) ===
             sum_pred_x0 += pred_x0
             sum_sq_pred_x0 += pred_x0 ** 2
             step_count += 1
-            # ============================================
             
             if callback: callback(i)
             if img_callback: img_callback(samples, i)
 
-        # === 高速化: 最終的な分散を計算 ===
-        # Var(X) = E[X^2] - (E[X])^2
         if step_count > 0:
             mean = sum_pred_x0 / step_count
             mean_sq = sum_sq_pred_x0 / step_count
             temporal_variance = mean_sq - mean ** 2
-            # 負の値になるのを防ぐ (数値誤差対策)
             temporal_variance = torch.relu(temporal_variance)
         else:
             temporal_variance = torch.zeros(size, device=self.model.device)
             
-        # img2img.py との互換性のためリスト形式で返す
-        # (ステップ0の時点で確定した不確実性マップとして返す)
         uncertainty_history = [(0, temporal_variance)]
-        # ==================================
 
         return samples, uncertainty_history
+
+    @torch.no_grad()
+    def sample_inpainting_awgn(self, S, batch_size, shape, noisy_latent, snr_db, mask, x0,
+                               callback=None, normals_sequence=None, img_callback=None, quantize_x0=False,
+                               eta=0., temperature=1., noise_dropout=0.,
+                               score_corrector=None, corrector_kwargs=None, verbose=True,
+                               log_every_t=100, unconditional_guidance_scale=1., unconditional_conditioning=None,
+                               **kwargs):
+        """
+        AWGN環境下での再送を用いたInpainting-aware Sampling
+        mask: 1.0 (Retransmission/GT), 0.0 (Unknown/Predicted)
+        x0: Ground Truth Latent
+        """
+        # 1. 拡散モデルのSNRスケジュールを取得
+        alphas = self.model.alphas_cumprod.cpu().numpy()
+        diffusion_snrs = alphas / (1 - alphas)
+        
+        # 2. 開始ステップの探索
+        target_snr = 10 ** (snr_db / 10.0)
+        t_start_idx = np.abs(diffusion_snrs - target_snr).argmin()
+        
+        if verbose:
+            print(f"Channel SNR: {snr_db} dB -> Inpainting Start Step: {t_start_idx}")
+
+        # 3. DDIMスケジュールの作成
+        self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=False)
+        timesteps = np.flip(self.ddim_timesteps)
+        
+        start_idx = 0
+        for i, t in enumerate(timesteps):
+            if t <= t_start_idx:
+                start_idx = i
+                break
+        
+        # 4. 開始状態 x_T の準備 (Unknown part)
+        # 受信した noisy_latent を開始点とする
+        alpha_at_start = alphas[t_start_idx]
+        alpha_at_start = torch.tensor(alpha_at_start, device=self.model.device, dtype=torch.float32)
+        x_start = torch.sqrt(alpha_at_start) * noisy_latent
+        
+        C, H, W = shape
+        samples = x_start
+        
+        # 5. Stepwise Inpainting Loop
+        iterator = tqdm(timesteps[start_idx:], desc='Inpainting AWGN', total=len(timesteps)-start_idx) if verbose else timesteps[start_idx:]
+
+        for i, step in enumerate(iterator):
+            index = len(timesteps) - start_idx - 1 - i
+            ts = torch.full((batch_size,), step, device=self.model.device, dtype=torch.long)
+            
+            # Predict x_{t-1} using model
+            outs = self.p_sample_ddim(samples, unconditional_conditioning, ts, index=index, use_original_steps=False,
+                                      quantize_denoised=quantize_x0, temperature=temperature,
+                                      noise_dropout=noise_dropout, score_corrector=score_corrector,
+                                      corrector_kwargs=corrector_kwargs,
+                                      unconditional_guidance_scale=unconditional_guidance_scale)
+            x_prev_pred, _ = outs
+            
+            # Calculate x_{t-1} for Known part (GT)
+            # x_{t-1} = sqrt(alpha_{t-1}) * x0 + sqrt(1 - alpha_{t-1}) * noise
+            a_prev = self.ddim_alphas_prev[index] # このステップの遷移先alpha (numpy)
+            
+            # === 修正箇所: numpy.sqrtを使用 ===
+            sqrt_a_prev = np.sqrt(a_prev)
+            sqrt_one_minus_a_prev = np.sqrt(1.0 - a_prev)
+            
+            noise = torch.randn_like(x0)
+            
+            # float * Tensor は自動的にブロードキャストされるのでOK
+            x_prev_known = sqrt_a_prev * x0 + sqrt_one_minus_a_prev * noise
+            
+            # Masking: Replace masked region with known noisy signal
+            samples = mask * x_prev_known + (1.0 - mask) * x_prev_pred
+            
+            if callback: callback(i)
+            if img_callback: img_callback(samples, i)
+
+        return samples, None
