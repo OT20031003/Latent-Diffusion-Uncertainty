@@ -201,7 +201,7 @@ def main():
     parser.add_argument("--input_dir", type=str, default="input_dir", help="Path to input images")
     parser.add_argument("--output_dir", type=str, default="results/", help="Path to output dir")
     parser.add_argument("--snr", type=float, default=-10.0, help="Channel SNR in dB")
-    parser.add_argument("--retransmission_rate", type=float, default=0.4, help="Retransmission rate (0.0-1.0)")
+    parser.add_argument("-r","--retransmission_rate", type=float, default=0.1, help="Retransmission rate (0.0-1.0)")
     parser.add_argument("--config", type=str, default="configs/latent-diffusion/ffhq-ldm-vq-4.yaml")
     parser.add_argument("--ckpt", type=str, default="models/ldm/ffhq256/model.ckpt")
     parser.add_argument("--ddim_steps", type=int, default=200)
@@ -228,7 +228,11 @@ def main():
     
     # 結果保存用変数
     all_results = {}
-    json_path = os.path.join(experiment_dir, "metrics.json")
+    
+    # --- 修正箇所: ファイル名にパラメータを含める ---
+    json_filename = f"metrics_snr{args.snr}dB_rate{args.retransmission_rate}.json"
+    json_path = os.path.join(experiment_dir, json_filename)
+    # ----------------------------------------
 
     # JSON保存用ヘルパー関数
     class NumpyEncoder(json.JSONEncoder):
