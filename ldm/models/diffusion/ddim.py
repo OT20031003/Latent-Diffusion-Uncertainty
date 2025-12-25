@@ -201,3 +201,94 @@ class DDIMSampler(object):
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
         return x_prev, pred_x0
+    
+    @torch.no_grad()
+    def sample_awgn(self, S, batch_size, shape, noisy_latent, snr_db, callback=None,
+                    normals_sequence=None, img_callback=None, quantize_x0=False,
+                    eta=0., mask=None, x0=None, temperature=1., noise_dropout=0.,
+                    score_corrector=None, corrector_kwargs=None, verbose=True,
+                    log_every_t=100, unconditional_guidance_scale=1., unconditional_conditioning=None,
+                    **kwargs):
+        """
+        AWGNチャネルの受信信号から復元を行う専用メソッド
+        noisy_latent: 受信信号 y (z0 + noise)
+        snr_db: チャネルのSNR (dB)
+        """
+        
+        # 1. 拡散モデルのSNRスケジュールを取得
+        # alphas_cumprod は 1 -> 0 に向かって減っていく (signal power)
+        alphas = self.model.alphas_cumprod.cpu().numpy()
+        
+        # 拡散過程における各時刻 t の SNR = alpha_t / (1 - alpha_t)
+        # alpha_t が大きい(初期)ほどSNRは高く、小さい(終盤)ほどSNRは低い
+        diffusion_snrs = alphas / (1 - alphas)
+        
+        # 2. チャネルSNRに最も近い拡散時刻 t_start を探索
+        target_snr = 10 ** (snr_db / 10.0)
+        
+        # abs(diffusion_snr - target_snr) が最小になるインデックスを探す
+        t_start_idx = np.abs(diffusion_snrs - target_snr).argmin()
+        
+        if verbose:
+            print(f"Channel SNR: {snr_db} dB -> Starting Diffusion Step: {t_start_idx} (Model SNR: {diffusion_snrs[t_start_idx]:.2f})")
+
+        # 3. DDIMスケジュールの作成 (Sステップに間引く)
+        self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=False)
+        
+        # 全1000ステップ中の t_start_idx に最も近い DDIMステップを探す
+        # self.ddim_timesteps は [0, 20, 40, ...] のような間引かれたリスト
+        closest_ddim_idx = np.abs(self.ddim_timesteps - t_start_idx).argmin()
+        
+        # これが逆拡散の開始ステップ数 (例: 50ステップ中、残り30ステップ目から開始など)
+        # ddim_timesteps は昇順なので、逆順ループのためにインデックスを調整する必要があるが、
+        # ここでは単純に timesteps 配列のどこから始めるかを決める
+        
+        # DDIMサンプリング用のタイムステップリスト (逆順: T -> 0)
+        # 例: [980, 960, ..., 0]
+        timesteps = np.flip(self.ddim_timesteps)
+        
+        # 開始すべき時刻 t_start_ddim (例: 980ではなく600ぐらいから始めたい)
+        # timesteps配列の中で、t_start_idx 以下の値を持つ最初のインデックスを探す
+        start_idx = 0
+        for i, t in enumerate(timesteps):
+            if t <= t_start_idx:
+                start_idx = i
+                break
+        
+        # 4. 開始状態 x_T の準備
+        # チャネル受信信号 y = z0 + n を、拡散モデルの状態 x_t にスケーリング
+        # x_t = sqrt(alpha_t) * z0 + sqrt(1-alpha_t) * eps
+        # 受信信号 y は z0 + (1/sqrt(SNR))*eps 相当の比率を持つ
+        # 整合させるために y を sqrt(alpha_t) 倍すると、x_t 近似として扱える
+        
+        # t_start_idx 時点の alpha_bar を取得
+        alpha_at_start = alphas[t_start_idx]
+        alpha_at_start = torch.tensor(alpha_at_start, device=self.model.device, dtype=torch.float32)
+        
+        # 開始点 x_start = sqrt(alpha) * y
+        x_start = torch.sqrt(alpha_at_start) * noisy_latent
+        
+        # 5. サンプリングループ
+        C, H, W = shape
+        size = (batch_size, C, H, W)
+        samples = x_start
+
+        # start_idx から最後までループ
+        iterator = tqdm(timesteps[start_idx:], desc='AWGN Denoising', total=len(timesteps)-start_idx) if verbose else timesteps[start_idx:]
+
+        for i, step in enumerate(iterator):
+            index = len(timesteps) - start_idx - 1 - i
+            ts = torch.full((batch_size,), step, device=self.model.device, dtype=torch.long)
+            
+            # 前のステップの画像を取得
+            outs = self.p_sample_ddim(samples, unconditional_conditioning, ts, index=index, use_original_steps=False,
+                                      quantize_denoised=quantize_x0, temperature=temperature,
+                                      noise_dropout=noise_dropout, score_corrector=score_corrector,
+                                      corrector_kwargs=corrector_kwargs,
+                                      unconditional_guidance_scale=unconditional_guidance_scale)
+            samples, _ = outs
+            
+            if callback: callback(i)
+            if img_callback: img_callback(samples, i)
+
+        return samples, None
