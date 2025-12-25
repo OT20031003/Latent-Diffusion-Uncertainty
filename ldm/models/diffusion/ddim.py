@@ -201,18 +201,68 @@ class DDIMSampler(object):
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
         return x_prev, pred_x0
-    
+    @torch.no_grad()
+    def estimate_uncertainty(self, pred_x0, t, shape, num_samples=5, c=None, 
+                             unconditional_guidance_scale=1., unconditional_conditioning=None):
+        """
+        Algorithm 1: Pixel-wise Uncertainty Estimation (Latent Space版)
+        pred_x0: 現在のステップで予測された潜在表現 z0 [Batch, C, H, W]
+        t: 現在のタイムステップ [Batch,]
+        shape: 潜在表現の形状 (Batch, C, H, W)
+        num_samples: モンテカルロサンプリング数 (M)。論文では M=5 推奨。
+        c: 条件付け入力 (conditioning)
+        """
+        # アルファ値の取得 (Equation 2用)
+        # tはバッチサイズ分のテンソルなので、代表値として最初の要素を取得
+        t_idx = t[0].item()
+        alpha_bar_t = self.model.alphas_cumprod[t_idx]
+        sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(1. - alpha_bar_t)
+
+        scores = []
+        
+        # M回ループして摂動を加えた潜在表現サンプルを作成し、スコアを計算
+        for _ in range(num_samples):
+            # 摂動 (Perturbation)
+            # Equation 2: X_t^i = sqrt(alpha_bar) * z0 + sqrt(1-alpha_bar) * epsilon
+            noise = torch.randn(shape, device=self.model.device)
+            x_t_perturbed = sqrt_alpha_bar_t * pred_x0 + sqrt_one_minus_alpha_bar_t * noise
+            
+            # モデルに入力してスコア(epsilon)を計算
+            # p_sample_ddimと同様にClassifier-Free Guidanceを考慮
+            if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
+                e_t = self.model.apply_model(x_t_perturbed, t, c)
+            else:
+                x_in = torch.cat([x_t_perturbed] * 2)
+                t_in = torch.cat([t] * 2)
+                c_in = torch.cat([unconditional_conditioning, c])
+                e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
+                e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
+                
+            scores.append(e_t)
+
+        # スタックして形状を (M, Batch, C, H, W) にする
+        scores = torch.stack(scores)
+        
+        # 分散を計算 (Equation 8: Variance of the scores)
+        # 次元0 (Mの方向) に沿って分散を取る。これが潜在空間上の不確実性マップとなる。
+        uncertainty = torch.var(scores, dim=0)
+        
+        return uncertainty
+
     @torch.no_grad()
     def sample_awgn(self, S, batch_size, shape, noisy_latent, snr_db, callback=None,
                     normals_sequence=None, img_callback=None, quantize_x0=False,
                     eta=0., mask=None, x0=None, temperature=1., noise_dropout=0.,
                     score_corrector=None, corrector_kwargs=None, verbose=True,
                     log_every_t=100, unconditional_guidance_scale=1., unconditional_conditioning=None,
+                    uncertainty_interval=10, # 不確実性を計算する間隔（ステップ数）
                     **kwargs):
         """
         AWGNチャネルの受信信号から復元を行う専用メソッド
         noisy_latent: 受信信号 y (z0 + noise)
         snr_db: チャネルのSNR (dB)
+        戻り値: (samples, uncertainty_map)
         """
         
         # 1. 拡散モデルのSNRスケジュールを取得
@@ -220,13 +270,10 @@ class DDIMSampler(object):
         alphas = self.model.alphas_cumprod.cpu().numpy()
         
         # 拡散過程における各時刻 t の SNR = alpha_t / (1 - alpha_t)
-        # alpha_t が大きい(初期)ほどSNRは高く、小さい(終盤)ほどSNRは低い
         diffusion_snrs = alphas / (1 - alphas)
         
         # 2. チャネルSNRに最も近い拡散時刻 t_start を探索
         target_snr = 10 ** (snr_db / 10.0)
-        
-        # abs(diffusion_snr - target_snr) が最小になるインデックスを探す
         t_start_idx = np.abs(diffusion_snrs - target_snr).argmin()
         
         if verbose:
@@ -236,19 +283,12 @@ class DDIMSampler(object):
         self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=False)
         
         # 全1000ステップ中の t_start_idx に最も近い DDIMステップを探す
-        # self.ddim_timesteps は [0, 20, 40, ...] のような間引かれたリスト
         closest_ddim_idx = np.abs(self.ddim_timesteps - t_start_idx).argmin()
         
-        # これが逆拡散の開始ステップ数 (例: 50ステップ中、残り30ステップ目から開始など)
-        # ddim_timesteps は昇順なので、逆順ループのためにインデックスを調整する必要があるが、
-        # ここでは単純に timesteps 配列のどこから始めるかを決める
-        
         # DDIMサンプリング用のタイムステップリスト (逆順: T -> 0)
-        # 例: [980, 960, ..., 0]
         timesteps = np.flip(self.ddim_timesteps)
         
-        # 開始すべき時刻 t_start_ddim (例: 980ではなく600ぐらいから始めたい)
-        # timesteps配列の中で、t_start_idx 以下の値を持つ最初のインデックスを探す
+        # 開始すべき時刻 t_start_ddim を探す
         start_idx = 0
         for i, t in enumerate(timesteps):
             if t <= t_start_idx:
@@ -256,12 +296,7 @@ class DDIMSampler(object):
                 break
         
         # 4. 開始状態 x_T の準備
-        # チャネル受信信号 y = z0 + n を、拡散モデルの状態 x_t にスケーリング
-        # x_t = sqrt(alpha_t) * z0 + sqrt(1-alpha_t) * eps
-        # 受信信号 y は z0 + (1/sqrt(SNR))*eps 相当の比率を持つ
-        # 整合させるために y を sqrt(alpha_t) 倍すると、x_t 近似として扱える
-        
-        # t_start_idx 時点の alpha_bar を取得
+        # 受信信号 y を拡散モデルの状態 x_t にスケーリング
         alpha_at_start = alphas[t_start_idx]
         alpha_at_start = torch.tensor(alpha_at_start, device=self.model.device, dtype=torch.float32)
         
@@ -272,6 +307,9 @@ class DDIMSampler(object):
         C, H, W = shape
         size = (batch_size, C, H, W)
         samples = x_start
+        
+        # 最終的な不確実性マップを保持する変数
+        current_uncertainty = None
 
         # start_idx から最後までループ
         iterator = tqdm(timesteps[start_idx:], desc='AWGN Denoising', total=len(timesteps)-start_idx) if verbose else timesteps[start_idx:]
@@ -281,14 +319,32 @@ class DDIMSampler(object):
             ts = torch.full((batch_size,), step, device=self.model.device, dtype=torch.long)
             
             # 前のステップの画像を取得
+            # p_sample_ddim は (x_prev, pred_x0) を返す仕様になっている前提
             outs = self.p_sample_ddim(samples, unconditional_conditioning, ts, index=index, use_original_steps=False,
                                       quantize_denoised=quantize_x0, temperature=temperature,
                                       noise_dropout=noise_dropout, score_corrector=score_corrector,
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale)
-            samples, _ = outs
+            samples, pred_x0 = outs
+            
+            # === 不確実性の測定 (潜在空間) ===
+            # 計算負荷軽減のため、指定した間隔または特定の条件下でのみ実行
+            if i % uncertainty_interval == 0: 
+                 current_uncertainty = self.estimate_uncertainty(
+                     pred_x0, ts, size, 
+                     num_samples=5, # 論文推奨値 M=5
+                     c=unconditional_conditioning,
+                     unconditional_guidance_scale=unconditional_guidance_scale,
+                     unconditional_conditioning=unconditional_conditioning
+                 )
+            # ==============================
             
             if callback: callback(i)
             if img_callback: img_callback(samples, i)
 
-        return samples, None
+        # 復元画像(潜在表現)と、最後に計算された不確実性マップを返す
+        # 注意: 返り値が2つになったので、呼び出し元(img2img.pyなど)での受け取り方も変更が必要です
+        return samples, current_uncertainty
+    
+    
+   
