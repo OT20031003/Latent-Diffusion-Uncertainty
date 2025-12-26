@@ -52,71 +52,83 @@ class FaceParser:
         
         return parsing_original
 
-def create_semantic_uncertainty_mask(uncertainty_map, parsing_map, retransmission_rate=0.2):
+def create_semantic_uncertainty_mask(uncertainty_map, parsing_map, retransmission_rate=0.1):
     """
-    セグメントごとの不確実性を計算し、指定されたレートに収まるようにマスクを作成する関数。
-    重要度ウェイトは使用せず、純粋な不確実性平均スコアで判断します。
+    Latent空間上でセグメントごとの不確実性を評価し、正確なレートでマスクを作成する関数。
+    
+    Args:
+        uncertainty_map (np.ndarray): Latent空間の不確実性マップ (H_lat, W_lat) または (C, H_lat, W_lat)
+        parsing_map (np.ndarray): ピクセル空間のセグメンテーションマップ (H_img, W_img)
+        retransmission_rate (float): 再送率 (0.0 - 1.0)
+    
+    Returns:
+        np.ndarray: Latent空間サイズのマスク (H_lat, W_lat), 値は 0.0 または 1.0
     """
-    # uncertainty_map (Latent) を parsing_map (Pixel) のサイズに拡大
-    h, w = parsing_map.shape
-    u_map_resized = cv2.resize(uncertainty_map, (w, h), interpolation=cv2.INTER_NEAREST)
-    
-    segment_scores = {}
-    present_labels = np.unique(parsing_map)
-    
-    # 各パーツの不確実性平均を計算
-    for label in present_labels:
-        # 背景(0)を除外したい場合はここで continue
-        # if label == 0: continue 
+    # 1. Latent空間のサイズを取得
+    if uncertainty_map.ndim == 3:
+        # (C, H, W) の場合、チャンネル方向を平均して (H, W) にする
+        u_map_latent = np.mean(uncertainty_map, axis=0)
+    else:
+        u_map_latent = uncertainty_map
         
-        mask = (parsing_map == label)
-        if np.sum(mask) > 0:
-            segment_scores[label] = u_map_resized[mask].mean()
+    h_lat, w_lat = u_map_latent.shape
+
+    # 2. セグメンテーションマップをLatentサイズにダウンサンプリング
+    # クラスID(整数)を壊さないよう、必ず INTER_NEAREST を使用する
+    parsing_map_latent = cv2.resize(parsing_map, (w_lat, h_lat), interpolation=cv2.INTER_NEAREST)
+    
+    # 3. セグメントごとのスコア計算 (全てLatent空間で計算)
+    segment_scores = {}
+    present_labels = np.unique(parsing_map_latent)
+    
+    for label in present_labels:
+        # 背景(0)などを除外したい場合はここで制御可能
+        # if label == 0: continue
+        
+        mask_segment = (parsing_map_latent == label)
+        if np.sum(mask_segment) > 0:
+            # そのセグメントに属するLatentピクセルの不確実性平均をスコアとする
+            segment_scores[label] = u_map_latent[mask_segment].mean()
             
     # 不確実性が高い順にセグメントをソート
     sorted_segments = sorted(segment_scores.items(), key=lambda x: x[1], reverse=True)
     
-    final_mask = np.zeros_like(parsing_map, dtype=np.float32)
+    # 4. 予算に合わせてマスクを作成
+    final_mask = np.zeros_like(u_map_latent, dtype=np.float32)
     
-    # 許容される最大ピクセル数
-    total_pixels = h * w
+    total_pixels = h_lat * w_lat
     max_allowed_pixels = int(total_pixels * retransmission_rate)
     current_pixel_count = 0
     
     for label, score in sorted_segments:
-        # 既に予算がいっぱいの場合は終了
         if current_pixel_count >= max_allowed_pixels:
             break
             
-        mask = (parsing_map == label)
-        segment_pixels = np.sum(mask)
+        mask_segment = (parsing_map_latent == label)
+        segment_pixels = np.sum(mask_segment)
         
-        # このセグメントを丸ごと追加しても予算内に収まる場合
+        # セグメント丸ごと追加OKなら追加
         if current_pixel_count + segment_pixels <= max_allowed_pixels:
-            final_mask[mask] = 1.0
+            final_mask[mask_segment] = 1.0
             current_pixel_count += segment_pixels
             
-        # このセグメントを追加すると予算オーバーする場合 -> 間引き処理
+        # 予算オーバーする場合は、セグメント内の画素を不確実性順に選抜
         else:
-            remaining_budget = max_allowed_pixels - current_pixel_count
-            if remaining_budget > 0:
-                # このセグメント内のピクセル座標を取得
-                y_indices, x_indices = np.where(mask)
+            remaining = max_allowed_pixels - current_pixel_count
+            if remaining > 0:
+                # このセグメント内の座標を取得
+                y_idxs, x_idxs = np.where(mask_segment)
                 
-                # このセグメント内の不確実性値を取得
-                segment_uncertainties = u_map_resized[mask]
+                # その場所の不確実性値を取得
+                vals = u_map_latent[mask_segment]
                 
-                # セグメント内で不確実性が高い順にインデックスを取得 (argsortは昇順なので反転)
-                sorted_indices_local = np.argsort(segment_uncertainties)[::-1]
+                # セグメント内で不確実性が高い順にソートして上位のみ選択
+                local_sorted_indices = np.argsort(vals)[::-1] # 降順
+                selected_local_indices = local_sorted_indices[:remaining]
                 
-                # 予算分だけ上位のピクセルを選択
-                selected_indices_local = sorted_indices_local[:remaining_budget]
-                
-                # グローバル座標にマッピングしてマスクをオンにする
-                selected_y = y_indices[selected_indices_local]
-                selected_x = x_indices[selected_indices_local]
-                final_mask[selected_y, selected_x] = 1.0
-                
+                # 選択されたピクセルをマスクに追加
+                final_mask[y_idxs[selected_local_indices], x_idxs[selected_local_indices]] = 1.0
+            
             # 予算を満たしたので終了
             break
             

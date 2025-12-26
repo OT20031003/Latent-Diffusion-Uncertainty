@@ -50,6 +50,15 @@ except ImportError:
     IDLOSS_AVAILABLE = False
     print("Warning: 'facenet-pytorch' not found. ID Loss will be skipped.")
 
+# 【追加】FID計算用ライブラリ
+try:
+    from pytorch_fid import fid_score
+    FID_AVAILABLE = True
+except ImportError:
+    FID_AVAILABLE = False
+    print("Warning: 'pytorch-fid' not found. FID calculation will be skipped.")
+
+
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}...")
     pl_sd = torch.load(ckpt, map_location="cpu")
@@ -204,9 +213,10 @@ def create_random_mask(shape, rate, device):
     return mask
 
 def evaluate_and_save(x_rec, batch_input, batch_files, batch_out_dir, suffix, 
-                      loss_fn_lpips, loss_fn_dists, loss_fn_id):
+                      loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_save_dir=None):
     """
     画像の保存とメトリック計算を行うヘルパー関数
+    【修正】fid_save_dir引数を追加し、FID用の画像保存に対応
     """
     gt_01 = torch.clamp((batch_input + 1.0) / 2.0, 0.0, 1.0)
     rec_01 = torch.clamp((x_rec + 1.0) / 2.0, 0.0, 1.0)
@@ -220,9 +230,21 @@ def evaluate_and_save(x_rec, batch_input, batch_files, batch_out_dir, suffix,
         save_name = f"{fname_no_ext}_{suffix}{ext}"
         
         x_rec_np = rec_01[j].cpu().permute(1, 2, 0).numpy()
+        img_data = (x_rec_np * 255).astype(np.uint8)
+        img = Image.fromarray(img_data)
+
+        # 通常のバッチフォルダへ保存
         save_path = os.path.join(batch_out_dir, str(j), save_name)
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        Image.fromarray((x_rec_np * 255).astype(np.uint8)).save(save_path)
+        img.save(save_path)
+
+        # 【追加】FID用ディレクトリへの保存
+        if fid_save_dir is not None:
+            # FID計算ツールはファイル名ベースで比較することが多いため、
+            # 元のファイル名で保存する（またはsuffix付きで一意にする）
+            # ここではGTと対応させるため、元のファイル名 fname を使用して保存します
+            fid_save_path = os.path.join(fid_save_dir, fname)
+            img.save(fid_save_path)
 
         # メトリクス計算
         metrics = {}
@@ -277,6 +299,20 @@ def main():
     # 実験全体の結果を保存するディレクトリ
     experiment_dir = os.path.join(args.output_dir, f"snr{args.snr}dB_rate{args.retransmission_rate}")
     os.makedirs(experiment_dir, exist_ok=True)
+
+    # 【追加】FID計算用のディレクトリ準備
+    fid_root = os.path.join(experiment_dir, "fid_images")
+    fid_dirs = {
+        "gt": os.path.join(fid_root, "gt"),
+        "pass1": os.path.join(fid_root, "pass1"),
+        "pass2_uncertainty": os.path.join(fid_root, "pass2_uncertainty"),
+        "pass2_semantic": os.path.join(fid_root, "pass2_semantic"),
+        "pass2_random": os.path.join(fid_root, "pass2_random"),
+    }
+    # FIDが有効ならディレクトリを作成
+    if FID_AVAILABLE:
+        for d in fid_dirs.values():
+            os.makedirs(d, exist_ok=True)
     
     all_results = {}
     json_filename = f"metrics_snr{args.snr}dB_rate{args.retransmission_rate}.json"
@@ -288,10 +324,11 @@ def main():
             elif isinstance(obj, np.ndarray): return obj.tolist()
             return super(NumpyEncoder, self).default(obj)
 
-    def save_all_results():
+    # 保存処理関数
+    def save_final_results(final_data):
         try:
             with open(json_path, 'w') as f:
-                json.dump(all_results, f, indent=4, cls=NumpyEncoder)
+                json.dump(final_data, f, indent=4, cls=NumpyEncoder)
             print(f"  Saved metrics to {json_path}")
         except Exception as e:
             print(f"  Error saving metrics: {e}")
@@ -333,7 +370,12 @@ def main():
                     save_name = f"{fname_no_ext}_gt{ext}"
                     save_path = os.path.join(batch_out_dir, str(j), save_name)
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                    Image.fromarray((gt_np[j] * 255).astype(np.uint8)).save(save_path)
+                    img_data = (gt_np[j] * 255).astype(np.uint8)
+                    Image.fromarray(img_data).save(save_path)
+
+                    # 【追加】FID用ディレクトリへのGT保存
+                    if FID_AVAILABLE:
+                        Image.fromarray(img_data).save(os.path.join(fid_dirs["gt"], fname))
 
                 # 1. Encode & Channel
                 encoder_posterior = model.encode_first_stage(batch_input)
@@ -354,7 +396,8 @@ def main():
                 
                 pass1_results = evaluate_and_save(
                     valid_x_rec_pass1, valid_batch_input, batch_files, batch_out_dir, "pass1",
-                    loss_fn_lpips, loss_fn_dists, loss_fn_id
+                    loss_fn_lpips, loss_fn_dists, loss_fn_id,
+                    fid_save_dir=fid_dirs["pass1"] if FID_AVAILABLE else None # 【追加】FID保存
                 )
 
                 error_map_pass1 = torch.mean((valid_batch_input - valid_x_rec_pass1) ** 2, dim=1)
@@ -386,7 +429,8 @@ def main():
                     valid_x_rec_unc = x_rec_unc[:actual_bs]
                     pass2_unc_results = evaluate_and_save(
                         valid_x_rec_unc, valid_batch_input, batch_files, batch_out_dir, "pass2_unc",
-                        loss_fn_lpips, loss_fn_dists, loss_fn_id
+                        loss_fn_lpips, loss_fn_dists, loss_fn_id,
+                        fid_save_dir=fid_dirs["pass2_uncertainty"] if FID_AVAILABLE else None # 【追加】FID保存
                     )
 
                 # === Retransmission Logic (Method 3: Semantic/Face-aware) ===
@@ -416,20 +460,23 @@ def main():
                             parsing_map = np.zeros((img_tensor.shape[2], img_tensor.shape[3]), dtype=np.uint8)
 
                         u_map_single = unc_np[j].squeeze()
-                        pixel_mask = create_semantic_uncertainty_mask(u_map_single, parsing_map, args.retransmission_rate)
                         
-                        # Latentサイズに戻す
-                        m_tensor = torch.from_numpy(pixel_mask).unsqueeze(0).unsqueeze(0).float()
-                        latent_shape = (z0.shape[2], z0.shape[3])
-                        m_latent = F.interpolate(m_tensor, size=latent_shape, mode='nearest')
-                        mask_sem_list.append(m_latent)
+                        # 【修正】create_semantic_uncertainty_mask が Latentサイズのマスクを返すと想定
+                        latent_mask_np = create_semantic_uncertainty_mask(u_map_single, parsing_map, args.retransmission_rate)
                         
-                        # セマンティックマスクの保存
+                        # 【修正】リサイズせずに Tensor化 (1, 1, H_lat, W_lat)
+                        m_tensor = torch.from_numpy(latent_mask_np).unsqueeze(0).unsqueeze(0).float()
+                        mask_sem_list.append(m_tensor)
+                        
+                        # セマンティックマスクの保存 (Latentサイズを拡大して保存)
                         fname_no_ext = os.path.splitext(batch_files[j])[0]
                         save_name = f"{fname_no_ext}_mask_semantic.png"
                         save_path = os.path.join(batch_out_dir, str(j), save_name)
                         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                        mask_img_data = (pixel_mask * 255).astype(np.uint8)
+                        
+                        # 視認用に拡大 (Nearest)
+                        vis_mask = F.interpolate(m_tensor, size=(256, 256), mode='nearest').squeeze().cpu().numpy()
+                        mask_img_data = (vis_mask * 255).astype(np.uint8)
                         Image.fromarray(mask_img_data, mode='L').save(save_path)
                     
                     mask_semantic = torch.cat(mask_sem_list, dim=0).to(z0.device)
@@ -451,7 +498,8 @@ def main():
                     valid_x_rec_sem = x_rec_sem[:actual_bs]
                     pass2_sem_results = evaluate_and_save(
                         valid_x_rec_sem, valid_batch_input, batch_files, batch_out_dir, "pass2_semantic",
-                        loss_fn_lpips, loss_fn_dists, loss_fn_id
+                        loss_fn_lpips, loss_fn_dists, loss_fn_id,
+                        fid_save_dir=fid_dirs["pass2_semantic"] if FID_AVAILABLE else None # 【追加】FID保存
                     )
 
                 # === Retransmission Logic (Benchmark: Random) ===
@@ -477,7 +525,8 @@ def main():
                     valid_x_rec_rand = x_rec_rand[:actual_bs]
                     pass2_rand_results = evaluate_and_save(
                         valid_x_rec_rand, valid_batch_input, batch_files, batch_out_dir, "pass2_rand",
-                        loss_fn_lpips, loss_fn_dists, loss_fn_id
+                        loss_fn_lpips, loss_fn_dists, loss_fn_id,
+                        fid_save_dir=fid_dirs["pass2_random"] if FID_AVAILABLE else None # 【追加】FID保存
                     )
 
                 # === 結果統合 ===
@@ -498,8 +547,6 @@ def main():
                         }
                     }
                 
-                save_all_results()
-                
                 # Cleanup
                 del batch_input, z0, z_received_pass1, samples_pass1, history_pass1
                 del x_rec_pass1, valid_x_rec_pass1
@@ -509,7 +556,7 @@ def main():
                 gc.collect()
                 torch.cuda.empty_cache()
 
-        # === Summary ===
+        # === Summary Calculation ===
         method_labels = {
             "pass1": "Pass 1 (Initial)",
             "pass2_uncertainty": "Pass 2 (High Uncertainty)",
@@ -530,6 +577,45 @@ def main():
                 else:
                     averages[m_key][met] = None
 
+        # === FID Calculation ===
+        fids = {}
+        if FID_AVAILABLE:
+            print("\nCalculating FID...")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+            target_methods = ["pass1"]
+            if args.retransmission_rate > 0.0:
+                target_methods.extend(["pass2_uncertainty", "pass2_semantic", "pass2_random"])
+
+            for m_key in target_methods:
+                if m_key in fid_dirs and os.path.exists(fid_dirs[m_key]) and len(os.listdir(fid_dirs[m_key])) > 0:
+                    try:
+                        # GTフォルダ vs 各メソッドフォルダ
+                        fid_value = fid_score.calculate_fid_given_paths(
+                            [fid_dirs["gt"], fid_dirs[m_key]],
+                            batch_size=50,
+                            device=device,
+                            dims=2048
+                        )
+                        fids[m_key] = fid_value
+                        print(f"  FID ({m_key}): {fid_value:.4f}")
+                    except Exception as e:
+                        print(f"  Failed to calculate FID for {m_key}: {e}")
+                        fids[m_key] = None
+                else:
+                    fids[m_key] = None
+
+        # === Final Save ===
+        final_output = {
+            "per_image_results": all_results,
+            "summary": {
+                "averages": averages,
+                "fid": fids
+            }
+        }
+        save_final_results(final_output)
+
+        # === Best Score Calculation ===
         best_scores = {}
         for met in metric_keys:
             valid_avgs = [averages[m][met] for m in method_labels if averages[m][met] is not None]
@@ -538,24 +624,28 @@ def main():
                     best_scores[met] = max(valid_avgs)
                 else:
                     best_scores[met] = min(valid_avgs)
+        
+        # 【追加】FIDのベスト（最小値）を計算
+        valid_fids = [v for v in fids.values() if v is not None]
+        best_fid = min(valid_fids) if valid_fids else None
 
         GREEN = "\033[92m"
         RESET = "\033[0m"
         BOLD = "\033[1m"
 
-        print("\n" + "="*85)
+        print("\n" + "="*95)
         print(f"  SIMULATION SUMMARY: Average Metrics (N={len(all_results)})")
-        print("="*85)
-        header = f"{'Method':<30} | {'PSNR':<12} | {'LPIPS':<12} | {'DISTS':<12} | {'ID Loss':<12}"
+        print("="*95)
+        header = f"{'Method':<30} | {'PSNR':<10} | {'LPIPS':<10} | {'DISTS':<10} | {'ID Loss':<10} | {'FID':<10}"
         print(header)
-        print("-" * 85)
+        print("-" * 95)
 
         for m_key, m_name in method_labels.items():
             row_str = f"{m_name:<30}"
             for met in metric_keys:
                 val = averages[m_key].get(met)
                 if val is None:
-                    row_str += f" | {'N/A':<12}"
+                    row_str += f" | {'N/A':<10}"
                     continue
                 val_str = f"{val:.4f}"
                 is_best = False
@@ -564,19 +654,33 @@ def main():
                 if is_best:
                     row_str += f" | {GREEN}{BOLD}*{val_str}* {RESET}"
                 else:
-                    row_str += f" | {val_str:<12}"
+                    row_str += f" | {val_str:<10}"
+            
+            # FID表示（強調表示ロジック追加）
+            fid_val = fids.get(m_key)
+            if fid_val is not None:
+                 fid_str = f"{fid_val:.4f}"
+                 if best_fid is not None and abs(fid_val - best_fid) < 1e-6:
+                     row_str += f" | {GREEN}{BOLD}*{fid_str}* {RESET}"
+                 else:
+                     row_str += f" | {fid_str:<10}    "
+            else:
+                 row_str += f" | {'N/A':<10}"
+
             print(row_str)
-        print("-" * 85 + "\n")
+        print("-" * 95 + "\n")
 
     except KeyboardInterrupt:
         print("\n\n!!! Simulation Interrupted by User !!!")
         print("Saving results collected so far...")
-        save_all_results()
+        if 'all_results' in locals():
+            save_final_results({"per_image_results": all_results, "summary": {"interrupted": True}})
         print("Exiting...")
 
     except Exception as e:
         print(f"\n\n!!! An error occurred: {e} !!!")
-        save_all_results()
+        if 'all_results' in locals():
+             save_final_results({"per_image_results": all_results, "summary": {"error": str(e)}})
         raise e
 
     print("Simulation Finished.")
