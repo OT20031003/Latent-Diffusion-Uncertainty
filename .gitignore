@@ -7,4 +7,5 @@ content.pdf
 DiffCom*
 COCO
 face-parsing.PyTorch
-log_*
+
+models/face_parsing/79999_iter.pth
