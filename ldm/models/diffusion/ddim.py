@@ -52,6 +52,8 @@ class DDIMSampler(object):
                         1 - self.alphas_cumprod / self.alphas_cumprod_prev))
         self.register_buffer('ddim_sigmas_for_original_num_steps', sigmas_for_original_sampling_steps)
 
+    
+
     @torch.no_grad()
     def sample(self,
                S,
@@ -242,6 +244,7 @@ class DDIMSampler(object):
                     score_corrector=None, corrector_kwargs=None, verbose=True,
                     log_every_t=100, unconditional_guidance_scale=1., unconditional_conditioning=None,
                     uncertainty_interval=None, 
+                    calc_wacv_uncertainty=False, # <--- 追加: WACV計算用フラグ
                     **kwargs):
         
         # 1. 拡散モデルのSNRスケジュールを取得
@@ -259,7 +262,6 @@ class DDIMSampler(object):
         self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=False)
         
         # 全1000ステップ中の t_start_idx に最も近い DDIMステップを探す
-        closest_ddim_idx = np.abs(self.ddim_timesteps - t_start_idx).argmin()
         timesteps = np.flip(self.ddim_timesteps)
         
         start_idx = 0
@@ -278,9 +280,13 @@ class DDIMSampler(object):
         size = (batch_size, C, H, W)
         samples = x_start
         
+        # --- 既存手法用 (Temporal Variance) ---
         sum_pred_x0 = torch.zeros(size, device=self.model.device)
         sum_sq_pred_x0 = torch.zeros(size, device=self.model.device)
         step_count = 0
+
+        # --- 新規手法用 (WACV Summed Variance) ---
+        wacv_uncertainty_accumulator = torch.zeros(size, device=self.model.device)
 
         iterator = tqdm(timesteps[start_idx:], desc='AWGN Denoising', total=len(timesteps)-start_idx) if verbose else timesteps[start_idx:]
 
@@ -288,6 +294,14 @@ class DDIMSampler(object):
             index = len(timesteps) - start_idx - 1 - i
             ts = torch.full((batch_size,), step, device=self.model.device, dtype=torch.long)
             
+            # === WACV Uncertainty Calculation ===
+            # 論文ではM=5程度を使用。全ステップで計算し累積する。
+            if calc_wacv_uncertainty:
+                unc_t = self.estimate_uncertainty_wacv(samples, ts, unconditional_conditioning, 
+                                                       num_samples=5,
+                                                       unconditional_guidance_scale=unconditional_guidance_scale)
+                wacv_uncertainty_accumulator += unc_t
+
             outs = self.p_sample_ddim(samples, unconditional_conditioning, ts, index=index, use_original_steps=False,
                                       quantize_denoised=quantize_x0, temperature=temperature,
                                       noise_dropout=noise_dropout, score_corrector=score_corrector,
@@ -295,6 +309,7 @@ class DDIMSampler(object):
                                       unconditional_guidance_scale=unconditional_guidance_scale)
             samples, pred_x0 = outs
             
+            # Temporal Variance Accumulation
             sum_pred_x0 += pred_x0
             sum_sq_pred_x0 += pred_x0 ** 2
             step_count += 1
@@ -302,6 +317,7 @@ class DDIMSampler(object):
             if callback: callback(i)
             if img_callback: img_callback(samples, i)
 
+        # --- Compute Temporal Variance ---
         if step_count > 0:
             mean = sum_pred_x0 / step_count
             mean_sq = sum_sq_pred_x0 / step_count
@@ -310,7 +326,12 @@ class DDIMSampler(object):
         else:
             temporal_variance = torch.zeros(size, device=self.model.device)
             
-        uncertainty_history = [(0, temporal_variance)]
+        # 履歴としてタプルリストで返す (互換性維持のため、リスト構造を採用)
+        # [ (Name, Map), (Name, Map), ... ]
+        uncertainty_history = [
+            ("temporal", temporal_variance),
+            ("wacv", wacv_uncertainty_accumulator)
+        ]
 
         return samples, uncertainty_history
 
@@ -391,3 +412,62 @@ class DDIMSampler(object):
             if img_callback: img_callback(samples, i)
 
         return samples, None
+    
+    @torch.no_grad()
+    def estimate_uncertainty_wacv(self, x_t, t, c, num_samples=5,
+                                  unconditional_guidance_scale=1.,
+                                  unconditional_conditioning=None):
+        """
+        Implementation of Algorithm 1 from WACV 2025 paper:
+        "Diffusion Model Guided Sampling with Pixel-Wise Aleatoric Uncertainty Estimation"
+        """
+        b, *_, device = *x_t.shape, x_t.device
+        t_idx = t[0].item() # バッチ内で時刻tは同じと仮定
+        
+        # 1. 係数の取得 (修正箇所: np.sqrt -> torch.sqrt)
+        # self.model.alphas_cumprod はGPU上のTensorなので、そのままTorchで計算します
+        alpha_cumprod_t = self.model.alphas_cumprod[t_idx]
+        
+        # エラー修正: np.sqrtを使わず、Tensorのまま平方根を計算
+        sqrt_alpha_cumprod_t = alpha_cumprod_t.sqrt()
+        sqrt_one_minus_alpha_cumprod_t = (1. - alpha_cumprod_t).sqrt()
+
+        # 2. 現在のスコア e_t を計算し、x0 を予測 (Eq. 7 in paper)
+        if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
+            e_t = self.model.apply_model(x_t, t, c)
+        else:
+            x_in = torch.cat([x_t] * 2)
+            t_in = torch.cat([t] * 2)
+            c_in = torch.cat([unconditional_conditioning, c])
+            e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
+            e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
+
+        # DDIM Eq. 12 (prediction of x0)
+        pred_x0 = (x_t - sqrt_one_minus_alpha_cumprod_t * e_t) / sqrt_alpha_cumprod_t
+
+        # 3. モンテカルロサンプリングでスコアの分散を計算 (Eq. 2 & Eq. 8 in paper)
+        scores = []
+        for _ in range(num_samples):
+            # Re-noise: Sample X_t^i ~ q(X_t | pred_x0)
+            epsilon = torch.randn_like(x_t)
+            x_t_perturbed = sqrt_alpha_cumprod_t * pred_x0 + sqrt_one_minus_alpha_cumprod_t * epsilon
+            
+            # Compute score for perturbed input
+            if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
+                e_p = self.model.apply_model(x_t_perturbed, t, c)
+            else:
+                x_in_p = torch.cat([x_t_perturbed] * 2)
+                t_in_p = torch.cat([t] * 2)
+                # c is reused
+                c_in_p = torch.cat([unconditional_conditioning, c])
+                e_t_uncond_p, e_p = self.model.apply_model(x_in_p, t_in_p, c_in_p).chunk(2)
+                e_p = e_t_uncond_p + unconditional_guidance_scale * (e_p - e_t_uncond_p)
+            
+            scores.append(e_p)
+
+        scores = torch.stack(scores) # [M, B, C, H, W]
+        
+        # Pixel-wise variance (Eq. 8)
+        uncertainty = torch.var(scores, dim=0) # [B, C, H, W]
+        
+        return uncertainty

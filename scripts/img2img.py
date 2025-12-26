@@ -107,6 +107,7 @@ def compute_structural_uncertainty(uncertainty_map, latents_pass1=None, alpha=0.
     """
     不確実性マップの平滑化＋確率的ノイズ混合
     """
+    if uncertainty_map is None: return None
     kernel_size = 5
     sigma = 2.0
     channels = uncertainty_map.shape[1]
@@ -134,6 +135,34 @@ def compute_structural_uncertainty(uncertainty_map, latents_pass1=None, alpha=0.
     weighted_map = (1 - alpha) * norm_unc + alpha * noise
     return weighted_map
 
+def compute_edge_map(images, target_hw):
+    """
+    画像からSobelフィルタでエッジマップを計算し、Latentサイズにリサイズして返す
+    images: [B, 3, H, W], range [-1, 1]
+    target_hw: (height, width) of latent
+    """
+    # 1. Convert to Grayscale & [0, 1] normalization
+    gray = (images + 1.0) / 2.0
+    # RGB to Grayscale coefficients
+    gray = 0.299 * gray[:, 0] + 0.587 * gray[:, 1] + 0.114 * gray[:, 2]
+    gray = gray.unsqueeze(1) # [B, 1, H, W]
+
+    # 2. Sobel Filters setup
+    k_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=images.device, dtype=torch.float32).view(1, 1, 3, 3)
+    k_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=images.device, dtype=torch.float32).view(1, 1, 3, 3)
+
+    # 3. Apply Convolution
+    gx = F.conv2d(gray, k_x, padding=1)
+    gy = F.conv2d(gray, k_y, padding=1)
+
+    # 4. Calculate Magnitude
+    magnitude = torch.sqrt(gx**2 + gy**2)
+
+    # 5. Downsample to latent spatial dimensions
+    edge_map = F.interpolate(magnitude, size=target_hw, mode='bilinear', align_corners=False)
+    
+    return edge_map
+
 def save_mask_tensor(mask_tensor, batch_files, batch_out_dir, suffix, target_size=(256, 256)):
     if mask_tensor is None: return
     mask_resized = F.interpolate(mask_tensor, size=target_size, mode='nearest')
@@ -147,6 +176,7 @@ def save_mask_tensor(mask_tensor, batch_files, batch_out_dir, suffix, target_siz
 
 def create_retransmission_mask(uncertainty_map, rate):
     if uncertainty_map is None: return None
+    # チャンネル平均をとって空間マップにする
     spatial_unc = torch.mean(uncertainty_map, dim=1, keepdim=True)
     b, c, h, w = spatial_unc.shape
     mask = torch.zeros_like(spatial_unc)
@@ -190,8 +220,8 @@ def evaluate_and_save(x_rec, batch_input, batch_files, batch_out_dir, suffix,
     return results
 
 def main():
-    parser = argparse.ArgumentParser(description="DiffCom Retransmission Simulation")
-    parser.add_argument("--input_dir", type=str, default="input_dir")
+    parser = argparse.ArgumentParser(description="DiffCom Retransmission Simulation with WACV Uncertainty")
+    parser.add_argument("--input_dir", type=str, default="inpdir2")
     parser.add_argument("--output_dir", type=str, default="results/")
     parser.add_argument("--snr", type=float, default=-15.0)
     parser.add_argument("-r","--retransmission_rate", type=float, default=0.2)
@@ -218,7 +248,10 @@ def main():
     experiment_dir = os.path.join(args.output_dir, f"snr{args.snr}dB_rate{args.retransmission_rate}_alpha{args.struct_alpha}_seed{args.seed}")
     os.makedirs(experiment_dir, exist_ok=True)
     fid_root = os.path.join(experiment_dir, "fid_images")
-    fid_dirs = {k: os.path.join(fid_root, k) for k in ["gt", "pass1", "pass2_structural", "pass2_raw", "pass2_semantic", "pass2_random"]}
+    
+    # 評価対象のメソッド一覧
+    eval_keys = ["gt", "pass1", "pass2_structural", "pass2_raw", "pass2_wacv", "pass2_semantic", "pass2_random", "pass2_edge_rec", "pass2_edge_gt"]
+    fid_dirs = {k: os.path.join(fid_root, k) for k in eval_keys}
     if FID_AVAILABLE: [os.makedirs(d, exist_ok=True) for d in fid_dirs.values()]
     
     all_results = {}
@@ -253,32 +286,74 @@ def main():
                 z0 = z0.mode() if not isinstance(z0, torch.Tensor) else z0
                 z_received_pass1 = add_awgn_channel(z0, args.snr)
 
-                # Pass 1
-                samples_pass1, history_pass1 = sampler.sample_awgn(S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:], noisy_latent=z_received_pass1, snr_db=args.snr, eta=0.0)
-                uncertainty_map = history_pass1[0][1] if history_pass1 else None
+                # =================================================================
+                # Pass 1: WACVの不確実性(calc_wacv_uncertainty=True)を有効化
+                # =================================================================
+                samples_pass1, history_pass1 = sampler.sample_awgn(
+                    S=args.ddim_steps, 
+                    batch_size=args.batch_size, 
+                    shape=z0.shape[1:], 
+                    noisy_latent=z_received_pass1, 
+                    snr_db=args.snr, 
+                    eta=0.0,
+                    calc_wacv_uncertainty=True  # WACV手法のためにTrueにする
+                )
+                
+                # history_pass1 から各種不確実性マップを抽出
+                # history_pass1 structure: [("temporal", map_temporal), ("wacv", map_wacv)]
+                temporal_uncertainty_map = None
+                wacv_uncertainty_map = None
+                
+                if history_pass1:
+                    for h_name, h_map in history_pass1:
+                        if h_name == "temporal":
+                            temporal_uncertainty_map = h_map
+                        elif h_name == "wacv":
+                            wacv_uncertainty_map = h_map
+                
+                # 従来のコード互換用: semantic mask等で使う変数は temporal をデフォルトとしておく
+                uncertainty_map_for_sem = temporal_uncertainty_map
+
                 x_rec_pass1 = model.decode_first_stage(samples_pass1)
                 pass1_results = evaluate_and_save(x_rec_pass1[:actual_bs], valid_batch_input, batch_files, batch_out_dir, "pass1", loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs["pass1"] if FID_AVAILABLE else None)
 
-                # Pass 2 Methods
+                # === エッジマップ計算 ===
+                edge_map_rec = compute_edge_map(x_rec_pass1, (z0.shape[2], z0.shape[3]))
+                edge_map_gt = compute_edge_map(batch_input, (z0.shape[2], z0.shape[3]))
+
+                # =================================================================
+                # Pass 2 Methods Definition
+                # =================================================================
                 methods = [
-                    ("pass2_structural", lambda: create_retransmission_mask(compute_structural_uncertainty(uncertainty_map, samples_pass1, alpha=args.struct_alpha), args.retransmission_rate)),
-                    ("pass2_raw", lambda: create_retransmission_mask(uncertainty_map, args.retransmission_rate))
+                    # 既存: Temporal Variance (Raw & Structural)
+                    ("pass2_structural", lambda: create_retransmission_mask(compute_structural_uncertainty(temporal_uncertainty_map, samples_pass1, alpha=args.struct_alpha), args.retransmission_rate)),
+                    ("pass2_raw", lambda: create_retransmission_mask(temporal_uncertainty_map, args.retransmission_rate)),
+                    
+                    # 新規: WACV (Score Variance)
+                    ("pass2_wacv", lambda: create_retransmission_mask(wacv_uncertainty_map, args.retransmission_rate)),
+                    
+                    # 既存: Edge
+                    ("pass2_edge_rec", lambda: create_retransmission_mask(edge_map_rec, args.retransmission_rate)),
+                    ("pass2_edge_gt", lambda: create_retransmission_mask(edge_map_gt, args.retransmission_rate))
                 ]
                 
                 results_batch = {"pass1": pass1_results}
                 for key, mask_gen in methods:
-                    if args.retransmission_rate > 0.0 and uncertainty_map is not None:
+                    if args.retransmission_rate > 0.0:
                         mask = mask_gen()
-                        save_mask_tensor(mask, batch_files, batch_out_dir, f"mask_{key.split('_')[1]}")
+                        # マスクが生成できない場合（マップがNone等）はスキップ
+                        if mask is None: continue
+                        
+                        save_mask_tensor(mask, batch_files, batch_out_dir, f"mask_{key.replace('pass2_', '')}")
                         s, _ = sampler.sample_inpainting_awgn(S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:], noisy_latent=z_received_pass1, snr_db=args.snr, mask=mask, x0=z0, eta=0.0)
                         results_batch[key] = evaluate_and_save(model.decode_first_stage(s)[:actual_bs], valid_batch_input, batch_files, batch_out_dir, key, loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs[key] if FID_AVAILABLE else None)
 
-                # Semantic
-                if args.retransmission_rate > 0.0 and uncertainty_map is not None and face_parser:
+                # Semantic (Uses temporal uncertainty by default in this logic, could switch to WACV if desired)
+                if args.retransmission_rate > 0.0 and uncertainty_map_for_sem is not None and face_parser:
                     mask_sem_list = []
                     for j in range(actual_bs):
                         p = face_parser.get_parsing_map(x_rec_pass1[j:j+1])
-                        m = torch.from_numpy(create_semantic_uncertainty_mask(uncertainty_map[j].cpu().numpy().squeeze(), p, args.retransmission_rate)).unsqueeze(0).unsqueeze(0).float()
+                        m = torch.from_numpy(create_semantic_uncertainty_mask(uncertainty_map_for_sem[j].cpu().numpy().squeeze(), p, args.retransmission_rate)).unsqueeze(0).unsqueeze(0).float()
                         mask_sem_list.append(m)
                     mask_sem = torch.cat(mask_sem_list, dim=0)
                     save_mask_tensor(mask_sem, batch_files, batch_out_dir, "mask_semantic")
@@ -293,29 +368,49 @@ def main():
                     s, _ = sampler.sample_inpainting_awgn(S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:], noisy_latent=z_received_pass1, snr_db=args.snr, mask=mask_r, x0=z0, eta=0.0)
                     results_batch["pass2_random"] = evaluate_and_save(model.decode_first_stage(s)[:actual_bs], valid_batch_input, batch_files, batch_out_dir, "pass2_random", loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs["pass2_random"] if FID_AVAILABLE else None)
 
+                # 結果格納
+                eval_methods = ["pass1", "pass2_structural", "pass2_raw", "pass2_wacv", "pass2_semantic", "pass2_random", "pass2_edge_rec", "pass2_edge_gt"]
                 for f in batch_files:
-                    all_results[f] = {k: {"metrics": results_batch[k].get(f)} for k in ["pass1", "pass2_structural", "pass2_raw", "pass2_semantic", "pass2_random"] if results_batch.get(k)}
+                    all_results[f] = {k: {"metrics": results_batch[k].get(f)} for k in eval_methods if results_batch.get(k)}
                 gc.collect(); torch.cuda.empty_cache()
 
         # Summary & Highlighting
-        method_labels = {"pass1": "Pass 1 (Initial)", "pass2_structural": "Pass 2 (Struct/Smooth)", "pass2_raw": "Pass 2 (Raw/NoSmooth)", "pass2_semantic": "Pass 2 (Semantic/Face)", "pass2_random": "Pass 2 (Random)"}
+        method_labels = {
+            "pass1": "Pass 1 (Initial)", 
+            "pass2_structural": "Pass 2 (Struct/Smooth)", 
+            "pass2_raw": "Pass 2 (Raw/Temporal)", 
+            "pass2_wacv": "Pass 2 (WACV/ScoreVar)",  # <--- ラベル追加
+            "pass2_semantic": "Pass 2 (Semantic/Face)", 
+            "pass2_random": "Pass 2 (Random)",
+            "pass2_edge_rec": "Pass 2 (Edge/Rec)",
+            "pass2_edge_gt": "Pass 2 (Edge/GT-Oracle)"
+        }
+        
         metric_keys = ["psnr", "lpips", "dists", "id_loss"]
         averages = {m: {met: np.mean([all_results[f][m]["metrics"][met] for f in all_results if all_results[f].get(m) and all_results[f][m].get("metrics")]) for met in metric_keys} for m in method_labels}
         
         fids = {}
         if FID_AVAILABLE:
             for m in method_labels.keys():
-                fids[m] = fid_score.calculate_fid_given_paths([fid_dirs["gt"], fid_dirs[m]], 50, 'cuda', 2048) if os.path.exists(fid_dirs[m]) and len(os.listdir(fid_dirs[m]))>0 else None
+                if m in fid_dirs and os.path.exists(fid_dirs[m]) and len(os.listdir(fid_dirs[m])) > 0:
+                    try:
+                        fids[m] = fid_score.calculate_fid_given_paths([fid_dirs["gt"], fid_dirs[m]], 50, 'cuda', 2048)
+                    except Exception as e:
+                        print(f"FID calc failed for {m}: {e}")
+                        fids[m] = None
+                else:
+                    fids[m] = None
 
         best_scores = {met: (max if met == "psnr" else min)([averages[m][met] for m in method_labels if not np.isnan(averages[m][met])]) for met in metric_keys}
         valid_fids = [v for v in fids.values() if v is not None]
         best_fid = min(valid_fids) if valid_fids else None
 
         GREEN, BOLD, RESET = "\033[92m", "\033[1m", "\033[0m"
-        print("\n" + "="*95 + f"\n  SUMMARY (N={len(all_results)})\n" + "="*95)
+        print("\n" + "="*110 + f"\n  SUMMARY (N={len(all_results)})\n" + "="*110)
         print(f"{'Method':<30} | {'PSNR':<10} | {'LPIPS':<10} | {'DISTS':<10} | {'ID Loss':<10} | {'FID':<10}")
-        print("-" * 95)
+        print("-" * 110)
         for m, name in method_labels.items():
+            if m not in averages: continue
             row = f"{name:<30}"
             for met in metric_keys:
                 val = averages[m][met]
@@ -326,7 +421,7 @@ def main():
                 row += f" | {GREEN}{BOLD}*{f_val:.4f}*{RESET}" if best_fid and abs(f_val - best_fid) < 1e-7 else f" | {f_val:.4f}  "
             else: row += f" | {'N/A':<10}"
             print(row)
-        print("-" * 95)
+        print("-" * 110)
         with open(json_path, 'w') as f: json.dump({"summary": {"averages": averages, "fid": fids}}, f, indent=4)
     except Exception as e: print(f"Error: {e}"); raise e
 if __name__ == "__main__": main()
