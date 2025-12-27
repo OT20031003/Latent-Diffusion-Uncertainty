@@ -9,3 +9,6 @@ COCO
 face-parsing.PyTorch
 results_h
 models/face_parsing/79999_iter.pth
+results_experiment
+results*
+log*

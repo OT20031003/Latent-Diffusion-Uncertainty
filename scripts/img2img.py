@@ -131,6 +131,7 @@ def compute_structural_uncertainty(uncertainty_map, latents_pass1=None, alpha=0.
     max_val = smoothed_unc.view(b_sz, -1).max(dim=1, keepdim=True)[0].view(b_sz, 1, 1, 1)
     norm_unc = (smoothed_unc - min_val) / (max_val - min_val + 1e-8)
 
+    # 構造的不確実性にランダムノイズを混合
     noise = torch.rand_like(norm_unc)
     weighted_map = (1 - alpha) * norm_unc + alpha * noise
     return weighted_map
@@ -163,17 +164,6 @@ def compute_edge_map(images, target_hw):
     
     return edge_map
 
-def save_mask_tensor(mask_tensor, batch_files, batch_out_dir, suffix, target_size=(256, 256)):
-    if mask_tensor is None: return
-    mask_resized = F.interpolate(mask_tensor, size=target_size, mode='nearest')
-    mask_np = mask_resized.cpu().numpy()
-    for j, fname in enumerate(batch_files):
-        if j >= len(mask_np): break
-        m = mask_np[j].squeeze()
-        save_path = os.path.join(batch_out_dir, str(j), f"{os.path.splitext(fname)[0]}_{suffix}.png")
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        Image.fromarray((m * 255).astype(np.uint8), mode='L').save(save_path)
-
 def create_retransmission_mask(uncertainty_map, rate):
     if uncertainty_map is None: return None
     # チャンネル平均をとって空間マップにする
@@ -188,6 +178,45 @@ def create_retransmission_mask(uncertainty_map, rate):
             mask[i] = (spatial_unc[i] >= threshold).float()
     return mask
 
+def create_hybrid_mask(uncertainty_map, edge_map, rate, alpha=0.7, beta=0.3):
+    """
+    不確実性(Uncertainty)とエッジ(Edge/GT)を組み合わせたハイブリッドマスク
+    Priority: (High U, High E) > (High U, Low E) > (Low U, High E)
+    この優先順位を実現するため alpha > beta (例: 0.7 vs 0.3) とすることを推奨
+    """
+    if uncertainty_map is None or edge_map is None: return None
+    
+    # 1. Uncertainty Mapの前処理
+    # compute_structural_uncertainty の出力(weighted_map)は既に正規化に近い処理がされているが
+    # 安全のためチャンネル平均 -> 正規化を行う
+    spatial_unc = torch.mean(uncertainty_map, dim=1, keepdim=True)
+    
+    # 2. 正規化関数 (Batchごとに [0, 1])
+    def normalize(x):
+        b_sz = x.shape[0]
+        min_v = x.view(b_sz, -1).min(dim=1, keepdim=True)[0].view(b_sz, 1, 1, 1)
+        max_v = x.view(b_sz, -1).max(dim=1, keepdim=True)[0].view(b_sz, 1, 1, 1)
+        return (x - min_v) / (max_v - min_v + 1e-8)
+
+    norm_unc = normalize(spatial_unc)
+    norm_edge = normalize(edge_map)
+
+    # 3. スコア結合 (Uncertainty優先)
+    # alpha=0.7, beta=0.3 なら、Uncertaintyが支配的になる
+    combined_score = alpha * norm_unc + beta * norm_edge
+
+    # 4. マスク生成 (上位 R% を選択)
+    b, c, h, w = combined_score.shape
+    mask = torch.zeros_like(combined_score)
+    for i in range(b):
+        flat = combined_score[i].flatten()
+        k = int(flat.numel() * rate)
+        if k > 0:
+            threshold = torch.kthvalue(flat, flat.numel() - k + 1).values
+            mask[i] = (combined_score[i] >= threshold).float()
+            
+    return mask
+
 def create_random_mask(shape, rate, device):
     b, c, h, w = shape
     mask = torch.zeros(shape, device=device)
@@ -199,6 +228,17 @@ def create_random_mask(shape, rate, device):
             threshold = torch.kthvalue(flat, flat.numel() - k + 1).values
             mask[i] = (rnd >= threshold).float()
     return mask
+
+def save_mask_tensor(mask, batch_files, batch_out_dir, prefix):
+    """マスク画像を保存するヘルパー関数"""
+    # mask: [B, 1, H, W]
+    for j, fname in enumerate(batch_files):
+        m = mask[j, 0].cpu().numpy()
+        m_img = (m * 255).astype(np.uint8)
+        img = Image.fromarray(m_img, mode='L')
+        save_path = os.path.join(batch_out_dir, str(j), f"{os.path.splitext(fname)[0]}_{prefix}.png")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        img.save(save_path)
 
 def evaluate_and_save(x_rec, batch_input, batch_files, batch_out_dir, suffix, 
                       loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_save_dir=None):
@@ -220,7 +260,7 @@ def evaluate_and_save(x_rec, batch_input, batch_files, batch_out_dir, suffix,
     return results
 
 def main():
-    parser = argparse.ArgumentParser(description="DiffCom Retransmission Simulation with WACV Uncertainty")
+    parser = argparse.ArgumentParser(description="DiffCom Retransmission Simulation with Hybrid Mask")
     parser.add_argument("--input_dir", type=str, default="input_dir")
     parser.add_argument("--output_dir", type=str, default="results/")
     parser.add_argument("--snr", type=float, default=-15.0)
@@ -231,6 +271,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--face_model_path", type=str, default="models/face_parsing/79999_iter.pth")
     parser.add_argument("--struct_alpha", type=float, default=0.3)
+    parser.add_argument("--hybrid_alpha", type=float, default=0.7, help="Weight for Uncertainty in Hybrid mask")
+    parser.add_argument("--hybrid_beta", type=float, default=0.3, help="Weight for Edge in Hybrid mask")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -245,12 +287,12 @@ def main():
     loss_fn_id = InceptionResnetV1(pretrained='vggface2').cuda().eval() if IDLOSS_AVAILABLE else None
 
     image_files = sorted([f for f in os.listdir(args.input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-    experiment_dir = os.path.join(args.output_dir, f"snr{args.snr}dB_rate{args.retransmission_rate}_alpha{args.struct_alpha}_seed{args.seed}")
+    experiment_dir = os.path.join(args.output_dir, f"snr{args.snr}dB_rate{args.retransmission_rate}_alpha{args.struct_alpha}_h{args.hybrid_alpha}-{args.hybrid_beta}")
     os.makedirs(experiment_dir, exist_ok=True)
     fid_root = os.path.join(experiment_dir, "fid_images")
     
-    # 評価対象のメソッド一覧
-    eval_keys = ["gt", "pass1", "pass2_structural", "pass2_raw", "pass2_wacv", "pass2_semantic", "pass2_random", "pass2_edge_rec", "pass2_edge_gt"]
+    # 評価対象のメソッド一覧 (Hybridを追加)
+    eval_keys = ["gt", "pass1", "pass2_structural", "pass2_raw", "pass2_wacv", "pass2_semantic", "pass2_random", "pass2_edge_rec", "pass2_edge_gt", "pass2_hybrid"]
     fid_dirs = {k: os.path.join(fid_root, k) for k in eval_keys}
     if FID_AVAILABLE: [os.makedirs(d, exist_ok=True) for d in fid_dirs.values()]
     
@@ -299,8 +341,7 @@ def main():
                     calc_wacv_uncertainty=True  # WACV手法のためにTrueにする
                 )
                 
-                # history_pass1 から各種不確実性マップを抽出
-                # history_pass1 structure: [("temporal", map_temporal), ("wacv", map_wacv)]
+                # 不確実性マップ抽出
                 temporal_uncertainty_map = None
                 wacv_uncertainty_map = None
                 
@@ -311,7 +352,6 @@ def main():
                         elif h_name == "wacv":
                             wacv_uncertainty_map = h_map
                 
-                # 従来のコード互換用: semantic mask等で使う変数は temporal をデフォルトとしておく
                 uncertainty_map_for_sem = temporal_uncertainty_map
 
                 x_rec_pass1 = model.decode_first_stage(samples_pass1)
@@ -321,12 +361,15 @@ def main():
                 edge_map_rec = compute_edge_map(x_rec_pass1, (z0.shape[2], z0.shape[3]))
                 edge_map_gt = compute_edge_map(batch_input, (z0.shape[2], z0.shape[3]))
 
+                # === Structural Uncertainty Map (Pass 2 StructuralとHybridで共用) ===
+                map_struct = compute_structural_uncertainty(temporal_uncertainty_map, samples_pass1, alpha=args.struct_alpha)
+
                 # =================================================================
                 # Pass 2 Methods Definition
                 # =================================================================
                 methods = [
-                    # 既存: Temporal Variance (Raw & Structural)
-                    ("pass2_structural", lambda: create_retransmission_mask(compute_structural_uncertainty(temporal_uncertainty_map, samples_pass1, alpha=args.struct_alpha), args.retransmission_rate)),
+                    # 既存: Temporal Variance (Struct & Raw)
+                    ("pass2_structural", lambda: create_retransmission_mask(map_struct, args.retransmission_rate)),
                     ("pass2_raw", lambda: create_retransmission_mask(temporal_uncertainty_map, args.retransmission_rate)),
                     
                     # 新規: WACV (Score Variance)
@@ -334,7 +377,10 @@ def main():
                     
                     # 既存: Edge
                     ("pass2_edge_rec", lambda: create_retransmission_mask(edge_map_rec, args.retransmission_rate)),
-                    ("pass2_edge_gt", lambda: create_retransmission_mask(edge_map_gt, args.retransmission_rate))
+                    ("pass2_edge_gt", lambda: create_retransmission_mask(edge_map_gt, args.retransmission_rate)),
+
+                    # ★新規提案: Hybrid (Uncertainty + Edge/GT)
+                    ("pass2_hybrid", lambda: create_hybrid_mask(map_struct, edge_map_gt, args.retransmission_rate, args.hybrid_alpha, args.hybrid_beta))
                 ]
                 
                 results_batch = {"pass1": pass1_results}
@@ -348,7 +394,7 @@ def main():
                         s, _ = sampler.sample_inpainting_awgn(S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:], noisy_latent=z_received_pass1, snr_db=args.snr, mask=mask, x0=z0, eta=0.0)
                         results_batch[key] = evaluate_and_save(model.decode_first_stage(s)[:actual_bs], valid_batch_input, batch_files, batch_out_dir, key, loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs[key] if FID_AVAILABLE else None)
 
-                # Semantic (Uses temporal uncertainty by default in this logic, could switch to WACV if desired)
+                # Semantic
                 if args.retransmission_rate > 0.0 and uncertainty_map_for_sem is not None and face_parser:
                     mask_sem_list = []
                     for j in range(actual_bs):
@@ -369,7 +415,8 @@ def main():
                     results_batch["pass2_random"] = evaluate_and_save(model.decode_first_stage(s)[:actual_bs], valid_batch_input, batch_files, batch_out_dir, "pass2_random", loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs["pass2_random"] if FID_AVAILABLE else None)
 
                 # 結果格納
-                eval_methods = ["pass1", "pass2_structural", "pass2_raw", "pass2_wacv", "pass2_semantic", "pass2_random", "pass2_edge_rec", "pass2_edge_gt"]
+                # 評価メソッドに pass2_hybrid を追加
+                eval_methods = ["pass1", "pass2_structural", "pass2_raw", "pass2_wacv", "pass2_semantic", "pass2_random", "pass2_edge_rec", "pass2_edge_gt", "pass2_hybrid"]
                 for f in batch_files:
                     all_results[f] = {k: {"metrics": results_batch[k].get(f)} for k in eval_methods if results_batch.get(k)}
                 gc.collect(); torch.cuda.empty_cache()
@@ -379,11 +426,12 @@ def main():
             "pass1": "Pass 1 (Initial)", 
             "pass2_structural": "Pass 2 (Struct/Smooth)", 
             "pass2_raw": "Pass 2 (Raw/Temporal)", 
-            "pass2_wacv": "Pass 2 (WACV/ScoreVar)",  # <--- ラベル追加
+            "pass2_wacv": "Pass 2 (WACV/ScoreVar)",
             "pass2_semantic": "Pass 2 (Semantic/Face)", 
             "pass2_random": "Pass 2 (Random)",
             "pass2_edge_rec": "Pass 2 (Edge/Rec)",
-            "pass2_edge_gt": "Pass 2 (Edge/GT-Oracle)"
+            "pass2_edge_gt": "Pass 2 (Edge/GT-Oracle)",
+            "pass2_hybrid": "Pass 2 (Hybrid U+E)" # Label Added
         }
         
         metric_keys = ["psnr", "lpips", "dists", "id_loss"]

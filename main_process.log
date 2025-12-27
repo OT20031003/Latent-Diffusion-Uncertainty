@@ -1,2 +1,6 @@
 nohup: ignoring input
---- Exp1: Alpha Sensitivity (SNR -15dB, r=0.2) ---
+=================================================================
+ STARTING EXPERIMENT RUN (Total 30 runs)
+=================================================================
+--- Group 1: Finding Optimal Hybrid Ratio (SNR -15, R 0.2, StructAlpha 0.3) ---
+Running Exp 1: Hybrid Alpha 1.0 (Pure Uncertainty)...
