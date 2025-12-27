@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 import matplotlib.pyplot as plt
-import cv2  # 追加: Semantic Mask処理用
+import cv2
 
 # ==========================================
 # 自分自身のディレクトリをパスに追加
@@ -21,7 +21,6 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # --- Face Utils Import ---
 try:
-    # FaceParserのみインポートし、マスク生成ロジックは本ファイル内で定義して制御します
     from face_utils import FaceParser
     FACE_PARSING_AVAILABLE = True
 except ImportError as e:
@@ -141,34 +140,24 @@ def compute_structural_uncertainty(uncertainty_map, latents_pass1=None, alpha=0.
 def compute_edge_map(images, target_hw):
     """
     画像からSobelフィルタでエッジマップを計算し、Latentサイズにリサイズして返す
-    images: [B, 3, H, W], range [-1, 1]
-    target_hw: (height, width) of latent
     """
-    # 1. Convert to Grayscale & [0, 1] normalization
     gray = (images + 1.0) / 2.0
-    # RGB to Grayscale coefficients
     gray = 0.299 * gray[:, 0] + 0.587 * gray[:, 1] + 0.114 * gray[:, 2]
-    gray = gray.unsqueeze(1) # [B, 1, H, W]
+    gray = gray.unsqueeze(1) 
 
-    # 2. Sobel Filters setup
     k_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=images.device, dtype=torch.float32).view(1, 1, 3, 3)
     k_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=images.device, dtype=torch.float32).view(1, 1, 3, 3)
 
-    # 3. Apply Convolution
     gx = F.conv2d(gray, k_x, padding=1)
     gy = F.conv2d(gray, k_y, padding=1)
 
-    # 4. Calculate Magnitude
     magnitude = torch.sqrt(gx**2 + gy**2)
-
-    # 5. Downsample to latent spatial dimensions
     edge_map = F.interpolate(magnitude, size=target_hw, mode='bilinear', align_corners=False)
     
     return edge_map
 
 def create_retransmission_mask(uncertainty_map, rate):
     if uncertainty_map is None: return None
-    # チャンネル平均をとって空間マップにする
     spatial_unc = torch.mean(uncertainty_map, dim=1, keepdim=True)
     b, c, h, w = spatial_unc.shape
     mask = torch.zeros_like(spatial_unc)
@@ -181,9 +170,6 @@ def create_retransmission_mask(uncertainty_map, rate):
     return mask
 
 def create_hybrid_mask(uncertainty_map, edge_map, rate, alpha=0.7, beta=0.3):
-    """
-    不確実性(Uncertainty)とエッジ(Edge/GT)を組み合わせたハイブリッドマスク
-    """
     if uncertainty_map is None or edge_map is None: return None
     
     spatial_unc = torch.mean(uncertainty_map, dim=1, keepdim=True)
@@ -210,97 +196,94 @@ def create_hybrid_mask(uncertainty_map, edge_map, rate, alpha=0.7, beta=0.3):
             
     return mask
 
-def create_hybrid_mask_with_dilation(uncertainty_map, edge_map, rate, alpha=0.5, beta=0.5, dilation_kernel=3):
+def create_semantic_weighted_mask(binary_mask, parsing_map, retransmission_rate):
     """
-    Hybridマスクをさらに膨張(Dilation)させ、幻覚領域をブロックとして修復するマスク
+    受信側マスク(0/1)を受け取り、GTセマンティクスでフィルタリング・優先順位付けを行う。
+    Input:
+      binary_mask: 受信側からのフィードバック (Candidate Mask), (H, W) or (C, H, W)
+      parsing_map: 送信側のGTセマンティクス
     """
-    if uncertainty_map is None: return None
-    
-    # 基本のHybridスコア計算 (エッジがない場合はUncertaintyのみ)
-    spatial_unc = torch.mean(uncertainty_map, dim=1, keepdim=True)
-    
-    def normalize(x):
-        b_sz = x.shape[0]
-        min_v = x.view(b_sz, -1).min(dim=1, keepdim=True)[0].view(b_sz, 1, 1, 1)
-        max_v = x.view(b_sz, -1).max(dim=1, keepdim=True)[0].view(b_sz, 1, 1, 1)
-        return (x - min_v) / (max_v - min_v + 1e-8)
-
-    norm_unc = normalize(spatial_unc)
-    
-    if edge_map is not None:
-        norm_edge = normalize(edge_map)
-        combined_score = alpha * norm_unc + beta * norm_edge
+    if binary_mask.ndim == 3:
+        mask_latent = np.mean(binary_mask, axis=0)
     else:
-        combined_score = norm_unc
-
-    # Top-Kでバイナリマスク作成
-    b, c, h, w = combined_score.shape
-    binary_mask = torch.zeros_like(combined_score)
-    for i in range(b):
-        flat = combined_score[i].flatten()
-        k = int(flat.numel() * rate)
-        if k > 0:
-            threshold = torch.kthvalue(flat, flat.numel() - k + 1).values
-            binary_mask[i] = (combined_score[i] >= threshold).float()
-
-    # Dilation (膨張) 処理
-    if dilation_kernel > 1:
-        padding = (dilation_kernel - 1) // 2
-        kernel = torch.ones((1, 1, dilation_kernel, dilation_kernel), device=binary_mask.device)
-        dilated_mask = F.conv2d(binary_mask, kernel, padding=padding)
-        final_mask = (dilated_mask > 0).float()
-        # 注意: 膨張により指定したrateを超える可能性がありますが、
-        # 幻覚防止の観点からは構造的まとまりが重要であるため許容します。
-        # 厳密なレート制御が必要な場合は、スコア自体をMaxPoolingしてからTopKをとる手法もあります。
-    else:
-        final_mask = binary_mask
-
-    return final_mask
-
-def create_semantic_weighted_mask(uncertainty_map, parsing_map, retransmission_rate):
-    """
-    パーツ重要度に基づく重み付けマスク (幻覚防止・ID維持用)
-    """
-    # 1. Latent空間のサイズを取得
-    if uncertainty_map.ndim == 3:
-        u_map_latent = np.mean(uncertainty_map, axis=0)
-    else:
-        u_map_latent = uncertainty_map
+        mask_latent = binary_mask
         
-    h_lat, w_lat = u_map_latent.shape
+    h_lat, w_lat = mask_latent.shape
+    # マスクを0/1に二値化
+    mask_latent = (mask_latent > 0.5).astype(np.float32)
 
-    # 2. セグメンテーションマップをLatentサイズにリサイズ (NN)
     parsing_map_latent = cv2.resize(parsing_map, (w_lat, h_lat), interpolation=cv2.INTER_NEAREST)
 
-    # 3. 重要度ウェイト定義 (ID維持・幻覚防止のために目鼻立ちを強くブースト)
-    # 0:bg, 1:skin, 2-3:brows, 4-5:eyes, 10:nose, 11-13:mouth, 17:hair
+    # 重要度ウェイト定義
+    weights = {
+        4: 6.0, 5: 6.0,            # 目
+        2: 5.0, 3: 5.0,            # 眉
+        10: 5.0, 11: 5.0, 12: 5.0, 13: 5.0, # 鼻・口
+        1: 2.0,                    # 肌
+        17: 0.8,                   # 髪
+        0: 0.1                     # 背景
+    }
+    default_weight = 0.5
+
+    weight_map = np.full_like(mask_latent, default_weight)
+    for cls_id, w in weights.items():
+        weight_map[parsing_map_latent == cls_id] = w
+        
+    # スコア計算: マスクされている場所(1)のみウェイトが有効になる
+    # 微小ノイズを加えて、同一点数内での順位付けを行う
+    noise = np.random.rand(h_lat, w_lat) * 0.01
+    weighted_score = mask_latent * weight_map + noise
+    
+    # 予算内で上位を選択
+    flat_scores = weighted_score.flatten()
+    k = int(flat_scores.size * retransmission_rate)
+    
+    final_mask = np.zeros_like(mask_latent, dtype=np.float32)
+    if k > 0:
+        threshold_idx = flat_scores.size - k
+        threshold = np.partition(flat_scores, threshold_idx)[threshold_idx]
+        final_mask = (weighted_score >= threshold).astype(np.float32)
+        final_mask = final_mask * mask_latent
+        
+    return final_mask
+
+# =========================================================
+# 追加: Semantic Only Mask (Benchmark)
+# =========================================================
+def create_semantic_only_mask(shape, parsing_map, retransmission_rate):
+    """
+    [Benchmark] 不確実性を使わず、セマンティック重みのみに基づいてマスクを作成する。
+    """
+    h_lat, w_lat = shape
+    parsing_map_latent = cv2.resize(parsing_map, (w_lat, h_lat), interpolation=cv2.INTER_NEAREST)
+
     weights = {
         4: 6.0, 5: 6.0,            # 目 (最優先)
         2: 5.0, 3: 5.0,            # 眉
         10: 5.0, 11: 5.0, 12: 5.0, 13: 5.0, # 鼻・口
-        1: 2.0,                    # 肌 (頬の不自然さを防ぐ)
-        17: 0.8,                   # 髪 (ノイズが高くなりがちなので抑制)
-        0: 0.1                     # 背景 (ほぼ無視)
+        1: 2.0,                    # 肌
+        17: 0.8,                   # 髪
+        0: 0.1                     # 背景
     }
     default_weight = 0.5
 
-    weight_map = np.full_like(u_map_latent, default_weight)
+    # ベースのスコア（重みそのもの）
+    score_map = np.full((h_lat, w_lat), default_weight, dtype=np.float32)
     for cls_id, w in weights.items():
-        weight_map[parsing_map_latent == cls_id] = w
-        
-    # 4. スコア計算 (Uncertainty * Weight)
-    weighted_score = u_map_latent * weight_map
+        score_map[parsing_map_latent == cls_id] = w
     
-    # 5. 上位R%を選抜
-    flat_scores = weighted_score.flatten()
+    # Tie-breaking用の微小ノイズ
+    noise = np.random.rand(h_lat, w_lat) * 0.01
+    score_map += noise
+    
+    flat_scores = score_map.flatten()
     k = int(flat_scores.size * retransmission_rate)
     
-    final_mask = np.zeros_like(u_map_latent, dtype=np.float32)
+    final_mask = np.zeros_like(score_map, dtype=np.float32)
     if k > 0:
         threshold_idx = flat_scores.size - k
-        # 高速な閾値探索
         threshold = np.partition(flat_scores, threshold_idx)[threshold_idx]
-        final_mask = (weighted_score >= threshold).astype(np.float32)
+        final_mask = (score_map >= threshold).astype(np.float32)
         
     return final_mask
 
@@ -317,7 +300,6 @@ def create_random_mask(shape, rate, device):
     return mask
 
 def save_mask_tensor(mask, batch_files, batch_out_dir, prefix):
-    """マスク画像を保存するヘルパー関数"""
     for j, fname in enumerate(batch_files):
         m = mask[j, 0].cpu().numpy()
         m_img = (m * 255).astype(np.uint8)
@@ -346,7 +328,7 @@ def evaluate_and_save(x_rec, batch_input, batch_files, batch_out_dir, suffix,
     return results
 
 def main():
-    parser = argparse.ArgumentParser(description="DiffCom Retransmission Simulation with Semantic Weighting & Dilation")
+    parser = argparse.ArgumentParser(description="DiffCom Retransmission Simulation")
     parser.add_argument("--input_dir", type=str, default="input_dir")
     parser.add_argument("--output_dir", type=str, default="results/")
     parser.add_argument("--snr", type=float, default=-15.0)
@@ -357,30 +339,27 @@ def main():
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--face_model_path", type=str, default="models/face_parsing/79999_iter.pth")
     parser.add_argument("--struct_alpha", type=float, default=0.3)
-    parser.add_argument("--hybrid_alpha", type=float, default=0.7, help="Weight for Uncertainty in Hybrid mask")
-    parser.add_argument("--hybrid_beta", type=float, default=0.3, help="Weight for Edge in Hybrid mask")
-    parser.add_argument("--dilation_kernel", type=int, default=3, help="Kernel size for Hybrid Dilation")
+    parser.add_argument("--hybrid_alpha", type=float, default=0.7)
+    parser.add_argument("--hybrid_beta", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=42)
     
-    # --- 手法選択用の引数 ---
-    # hybrid_dilated を追加
-    available_methods = ["structural", "raw", "wacv", "semantic", "random", "edge_rec", "edge_gt", "hybrid", "hybrid_dilated"]
+    # semantic_only を追加
+    available_methods = ["structural", "raw", "wacv", "semantic", "semantic_only", "random", "edge_rec", "edge_gt", "hybrid"]
     parser.add_argument("--target_methods", nargs='+', default=["all"], 
                         help=f"Select methods to run. Options: {', '.join(available_methods)} or 'all'.")
     
     args = parser.parse_args()
 
-    # --- 実行する手法の特定 ---
     method_name_map = {
         "structural": "pass2_structural",
         "raw": "pass2_raw",
         "wacv": "pass2_wacv",
         "semantic": "pass2_semantic",
+        "semantic_only": "pass2_semantic_only", # 追加
         "random": "pass2_random",
         "edge_rec": "pass2_edge_rec",
         "edge_gt": "pass2_edge_gt",
-        "hybrid": "pass2_hybrid",
-        "hybrid_dilated": "pass2_hybrid_dilated" # 追加
+        "hybrid": "pass2_hybrid"
     }
 
     if "all" in args.target_methods:
@@ -395,23 +374,23 @@ def main():
     
     print(f"Target Methods: {sorted(list(target_keys))}")
 
-    # 初期シード設定
     set_seed(args.seed)
     
     config = OmegaConf.load(args.config)
     model = load_model_from_config(config, args.ckpt)
     sampler = DDIMSampler(model)
 
-    # FaceParserはsemanticが選択されているときのみロード
-    use_semantic = "pass2_semantic" in target_keys
+    # semantic または semantic_only がある場合に FaceParser をロード
+    use_semantic = ("pass2_semantic" in target_keys) or ("pass2_semantic_only" in target_keys)
     face_parser = None
     if use_semantic:
         if FACE_PARSING_AVAILABLE and os.path.exists(args.face_model_path):
-            print(f"Loading FaceParser for semantic weighting...")
+            print(f"Loading FaceParser for semantic weighting (Sender-Side)...")
             face_parser = FaceParser(args.face_model_path, device='cuda')
         else:
             print("Warning: Semantic method selected but dependencies missing. Skipping.")
             target_keys.discard("pass2_semantic")
+            target_keys.discard("pass2_semantic_only")
 
     loss_fn_lpips = lpips.LPIPS(net='alex').cuda().eval() if LPIPS_AVAILABLE else None
     loss_fn_dists = DISTS().cuda().eval() if DISTS_AVAILABLE else None
@@ -433,13 +412,9 @@ def main():
     try:
         with torch.no_grad():
             for i in range(0, len(image_files), args.batch_size):
-                # =========================================================
-                # バッチごとのシード制御
-                # =========================================================
                 batch_idx = i // args.batch_size
                 current_batch_seed = args.seed + batch_idx
                 set_seed(current_batch_seed)
-                # =========================================================
 
                 batch_files = image_files[i : i + args.batch_size]
                 actual_bs = len(batch_files)
@@ -490,8 +465,8 @@ def main():
                 pass1_results = evaluate_and_save(x_rec_pass1[:actual_bs], valid_batch_input, batch_files, batch_out_dir, "pass1", loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs["pass1"] if FID_AVAILABLE else None)
 
                 # === エッジマップ計算 ===
-                need_edge = any(k in target_keys for k in ["pass2_edge_rec", "pass2_hybrid", "pass2_hybrid_dilated"])
-                need_edge_gt = any(k in target_keys for k in ["pass2_edge_gt", "pass2_hybrid", "pass2_hybrid_dilated"])
+                need_edge = any(k in target_keys for k in ["pass2_edge_rec", "pass2_hybrid"])
+                need_edge_gt = any(k in target_keys for k in ["pass2_edge_gt", "pass2_hybrid"])
                 
                 edge_map_rec = None
                 if need_edge:
@@ -502,30 +477,24 @@ def main():
                     edge_map_gt = compute_edge_map(batch_input, (z0.shape[2], z0.shape[3]))
 
                 # === Structural Uncertainty Map ===
-                need_struct = any(k in target_keys for k in ["pass2_structural", "pass2_hybrid", "pass2_hybrid_dilated"])
+                need_struct = any(k in target_keys for k in ["pass2_structural", "pass2_hybrid"])
                 map_struct = None
                 if need_struct:
                     map_struct = compute_structural_uncertainty(temporal_uncertainty_map, samples_pass1, alpha=args.struct_alpha)
 
-                # =================================================================
-                # Pass 2 Methods Definition
-                # =================================================================
                 method_candidates = [
                     ("pass2_structural", lambda: create_retransmission_mask(map_struct, args.retransmission_rate)),
                     ("pass2_raw", lambda: create_retransmission_mask(temporal_uncertainty_map, args.retransmission_rate)),
                     ("pass2_wacv", lambda: create_retransmission_mask(wacv_uncertainty_map, args.retransmission_rate)),
                     ("pass2_edge_rec", lambda: create_retransmission_mask(edge_map_rec, args.retransmission_rate)),
                     ("pass2_edge_gt", lambda: create_retransmission_mask(edge_map_gt, args.retransmission_rate)),
-                    ("pass2_hybrid", lambda: create_hybrid_mask(map_struct, edge_map_gt, args.retransmission_rate, args.hybrid_alpha, args.hybrid_beta)),
-                    # 追加: 膨張版Hybrid
-                    ("pass2_hybrid_dilated", lambda: create_hybrid_mask_with_dilation(map_struct, edge_map_gt, args.retransmission_rate, args.hybrid_alpha, args.hybrid_beta, args.dilation_kernel))
+                    ("pass2_hybrid", lambda: create_hybrid_mask(map_struct, edge_map_gt, args.retransmission_rate, args.hybrid_alpha, args.hybrid_beta))
                 ]
                 
                 active_methods = [m for m in method_candidates if m[0] in target_keys]
 
                 results_batch = {"pass1": pass1_results}
                 
-                # 通常メソッドの実行
                 for key, mask_gen in active_methods:
                     if args.retransmission_rate > 0.0:
                         set_seed(current_batch_seed + 1000)
@@ -537,20 +506,23 @@ def main():
                         results_batch[key] = evaluate_and_save(model.decode_first_stage(s)[:actual_bs], valid_batch_input, batch_files, batch_out_dir, key, loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs[key] if FID_AVAILABLE else None)
 
                 # =================================================================
-                # Semantic Weighted Method (アップグレード版)
+                # Semantic Weighted Method (0/1 Feedback Simulation)
                 # =================================================================
                 if "pass2_semantic" in target_keys and args.retransmission_rate > 0.0 and uncertainty_map_for_sem is not None and face_parser:
                     set_seed(current_batch_seed + 1000)
-                    
                     mask_sem_list = []
                     for j in range(actual_bs):
-                        p = face_parser.get_parsing_map(x_rec_pass1[j:j+1])
-                        # ★ここを変更: 新しい重み付け関数を使用
-                        # create_semantic_weighted_mask は numpy array を返すので tensor に変換
+                        # 1. 受信側でのマスク生成（Candidates）: 予算の3倍程度をピックアップ
+                        candidate_rate = min(1.0, args.retransmission_rate * 3.0)
+                        u_map = uncertainty_map_for_sem[j:j+1]
+                        mask_rec = create_retransmission_mask(u_map, candidate_rate) 
+                        
+                        # 2. 送信側でのフィルタリング
+                        p = face_parser.get_parsing_map(valid_batch_input[j:j+1])
                         m_np = create_semantic_weighted_mask(
-                            uncertainty_map_for_sem[j].cpu().numpy().squeeze(), 
+                            mask_rec.cpu().numpy().squeeze(), 
                             p, 
-                            args.retransmission_rate
+                            args.retransmission_rate 
                         )
                         m = torch.from_numpy(m_np).unsqueeze(0).unsqueeze(0).float()
                         mask_sem_list.append(m)
@@ -558,16 +530,41 @@ def main():
                     mask_sem = torch.cat(mask_sem_list, dim=0)
                     save_mask_tensor(mask_sem, batch_files, batch_out_dir, "mask_semantic_weighted")
                     
-                    # Batchサイズ調整
-                    mask_sem_p = mask_sem
                     if mask_sem.shape[0] < args.batch_size:
-                        mask_sem_p = torch.cat([mask_sem, mask_sem[-1:].repeat(args.batch_size-actual_bs, 1, 1, 1)], dim=0)
-                    mask_sem_p = mask_sem_p.cuda()
+                        mask_sem = torch.cat([mask_sem, mask_sem[-1:].repeat(args.batch_size-actual_bs, 1, 1, 1)], dim=0)
+                    mask_sem = mask_sem.cuda()
                         
-                    s, _ = sampler.sample_inpainting_awgn(S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:], noisy_latent=z_received_pass1, snr_db=args.snr, mask=mask_sem_p, x0=z0, eta=0.0)
+                    s, _ = sampler.sample_inpainting_awgn(S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:], noisy_latent=z_received_pass1, snr_db=args.snr, mask=mask_sem, x0=z0, eta=0.0)
                     results_batch["pass2_semantic"] = evaluate_and_save(model.decode_first_stage(s)[:actual_bs], valid_batch_input, batch_files, batch_out_dir, "pass2_semantic", loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs["pass2_semantic"] if FID_AVAILABLE else None)
 
-                # Random (Comparison)
+                # =================================================================
+                # Semantic ONLY Method (Benchmark, Sender-side) [追加]
+                # =================================================================
+                if "pass2_semantic_only" in target_keys and args.retransmission_rate > 0.0 and face_parser:
+                    set_seed(current_batch_seed + 1000)
+                    mask_sem_list = []
+                    for j in range(actual_bs):
+                        # GT画像からパース
+                        p = face_parser.get_parsing_map(valid_batch_input[j:j+1])
+                        # 不確実性を使わず、セマンティック重みのみでマスク生成
+                        m_np = create_semantic_only_mask(
+                            (z0.shape[2], z0.shape[3]), # (H, W)
+                            p, 
+                            args.retransmission_rate
+                        )
+                        m = torch.from_numpy(m_np).unsqueeze(0).unsqueeze(0).float()
+                        mask_sem_list.append(m)
+                    
+                    mask_sem = torch.cat(mask_sem_list, dim=0)
+                    save_mask_tensor(mask_sem, batch_files, batch_out_dir, "mask_semantic_only")
+                    
+                    if mask_sem.shape[0] < args.batch_size:
+                        mask_sem = torch.cat([mask_sem, mask_sem[-1:].repeat(args.batch_size-actual_bs, 1, 1, 1)], dim=0)
+                    mask_sem = mask_sem.cuda()
+                        
+                    s, _ = sampler.sample_inpainting_awgn(S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:], noisy_latent=z_received_pass1, snr_db=args.snr, mask=mask_sem, x0=z0, eta=0.0)
+                    results_batch["pass2_semantic_only"] = evaluate_and_save(model.decode_first_stage(s)[:actual_bs], valid_batch_input, batch_files, batch_out_dir, "pass2_semantic_only", loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs["pass2_semantic_only"] if FID_AVAILABLE else None)
+
                 if "pass2_random" in target_keys and args.retransmission_rate > 0.0:
                     set_seed(current_batch_seed + 1000)
                     mask_r = create_random_mask((z0.shape[0], 1, z0.shape[2], z0.shape[3]), args.retransmission_rate, z0.device)
@@ -575,23 +572,21 @@ def main():
                     s, _ = sampler.sample_inpainting_awgn(S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:], noisy_latent=z_received_pass1, snr_db=args.snr, mask=mask_r, x0=z0, eta=0.0)
                     results_batch["pass2_random"] = evaluate_and_save(model.decode_first_stage(s)[:actual_bs], valid_batch_input, batch_files, batch_out_dir, "pass2_random", loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs["pass2_random"] if FID_AVAILABLE else None)
 
-                # 結果格納
                 for f in batch_files:
                     all_results[f] = {k: {"metrics": results_batch[k].get(f)} for k in results_batch.keys() if results_batch.get(k)}
                 gc.collect(); torch.cuda.empty_cache()
 
-        # Summary
         method_labels = {
             "pass1": "Pass 1 (Initial)", 
             "pass2_structural": "Pass 2 (Struct/Smooth)", 
             "pass2_raw": "Pass 2 (Raw/Temporal)", 
             "pass2_wacv": "Pass 2 (WACV/ScoreVar)",
-            "pass2_semantic": "Pass 2 (Semantic/Weighted)", # Label変更: Weightedであることを明示
+            "pass2_semantic": "Pass 2 (Semantic/Weighted)", 
+            "pass2_semantic_only": "Pass 2 (Semantic/Only)", # 追加
             "pass2_random": "Pass 2 (Random)",
             "pass2_edge_rec": "Pass 2 (Edge/Rec)",
             "pass2_edge_gt": "Pass 2 (Edge/GT-Oracle)",
-            "pass2_hybrid": "Pass 2 (Hybrid U+E)",
-            "pass2_hybrid_dilated": "Pass 2 (Hybrid/Dilated)" # 追加
+            "pass2_hybrid": "Pass 2 (Hybrid U+E)"
         }
         
         executed_methods = [m for m in method_labels.keys() if m == "pass1" or m in target_keys]
