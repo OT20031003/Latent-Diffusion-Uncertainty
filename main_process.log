@@ -1,6 +1,6 @@
 nohup: ignoring input
 =================================================================
- STARTING EXPERIMENT RUN (Total 30 runs)
+ STARTING OPTIMIZED RUN: SA=0.0, Focused Hybrid Ratios
 =================================================================
---- Group 1: Finding Optimal Hybrid Ratio (SNR -15, R 0.2, StructAlpha 0.3) ---
-Running Exp 1: Hybrid Alpha 1.0 (Pure Uncertainty)...
+--- Group 1: SNR -15, Rate 0.2, StructAlpha 0.0 ---
+Running G1 Baselines...

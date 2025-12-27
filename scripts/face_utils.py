@@ -133,3 +133,72 @@ def create_semantic_uncertainty_mask(uncertainty_map, parsing_map, retransmissio
             break
             
     return final_mask
+def create_semantic_weighted_mask(uncertainty_map, parsing_map, retransmission_rate=0.1):
+    """
+    パーツごとの重要度に基づき不確実性を重み付けし、重要な領域（目、鼻、口）を優先してマスクを作成する。
+    
+    Args:
+        uncertainty_map (np.ndarray): Latent空間の不確実性マップ (C, H_lat, W_lat) または (H_lat, W_lat)
+        parsing_map (np.ndarray): ピクセル空間のセグメンテーションマップ (H_img, W_img)
+        retransmission_rate (float): 再送率 (0.0 - 1.0)
+    """
+    # 1. Latent空間のサイズを取得 & マップの準備
+    if uncertainty_map.ndim == 3:
+        u_map_latent = np.mean(uncertainty_map, axis=0)
+    else:
+        u_map_latent = uncertainty_map
+        
+    h_lat, w_lat = u_map_latent.shape
+
+    # 2. セグメンテーションマップをLatentサイズにダウンサンプリング (Nearest Neighbor)
+    parsing_map_latent = cv2.resize(parsing_map, (w_lat, h_lat), interpolation=cv2.INTER_NEAREST)
+
+    # 3. 重要度ウェイトの定義 (BiSeNetのクラスID準拠)
+    # 値が大きいほど優先的に再送される
+    # 0:bg, 1:skin, 2-3:brows, 4-5:eyes, 10:nose, 11-13:mouth, 17:hair
+    weights = {
+        # === 最優先 (構造とIDの核) ===
+        4: 6.0, 5: 6.0,   # 目
+        2: 5.0, 3: 5.0,   # 眉
+        10: 5.0,          # 鼻
+        11: 5.0, 12: 5.0, 13: 5.0, # 口・唇
+
+        # === 優先 (顔の形状) ===
+        1: 2.0,           # 肌 (幻覚が出やすい頬など)
+        
+        # === 低優先 (テクスチャ) ===
+        17: 0.8,          # 髪 (高周波ノイズでUncertaintyが高くなりがちなので下げる)
+        16: 0.5,          # 服
+        
+        # === 除外対象 ===
+        0: 0.1            # 背景
+    }
+    
+    # デフォルトの重み
+    default_weight = 0.5 
+
+    # 4. 重みマップの作成
+    weight_map = np.full_like(u_map_latent, default_weight)
+    
+    for class_id, w in weights.items():
+        weight_map[parsing_map_latent == class_id] = w
+        
+    # 5. スコアの計算 (不確実性 × 重要度)
+    # これにより、不確実性が低くても目が重要ならスコアが高くなる
+    weighted_score = u_map_latent * weight_map
+    
+    # 6. 上位R%を選抜してマスク生成
+    flat_scores = weighted_score.flatten()
+    k = int(flat_scores.size * retransmission_rate)
+    
+    final_mask = np.zeros_like(u_map_latent, dtype=np.float32)
+    
+    if k > 0:
+        # 上位k個の閾値を求めてマスク化
+        # (np.partitionを使うと高速にk番目の値を見つけられます)
+        threshold_idx = flat_scores.size - k
+        threshold = np.partition(flat_scores, threshold_idx)[threshold_idx]
+        
+        final_mask = (weighted_score >= threshold).astype(np.float32)
+        
+    return final_mask

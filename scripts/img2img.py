@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 import matplotlib.pyplot as plt
+import cv2  # 追加: Semantic Mask処理用
 
 # ==========================================
 # 自分自身のディレクトリをパスに追加
@@ -20,7 +21,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # --- Face Utils Import ---
 try:
-    from face_utils import FaceParser, create_semantic_uncertainty_mask
+    # FaceParserのみインポートし、マスク生成ロジックは本ファイル内で定義して制御します
+    from face_utils import FaceParser
     FACE_PARSING_AVAILABLE = True
 except ImportError as e:
     FACE_PARSING_AVAILABLE = False
@@ -181,17 +183,11 @@ def create_retransmission_mask(uncertainty_map, rate):
 def create_hybrid_mask(uncertainty_map, edge_map, rate, alpha=0.7, beta=0.3):
     """
     不確実性(Uncertainty)とエッジ(Edge/GT)を組み合わせたハイブリッドマスク
-    Priority: (High U, High E) > (High U, Low E) > (Low U, High E)
-    この優先順位を実現するため alpha > beta (例: 0.7 vs 0.3) とすることを推奨
     """
     if uncertainty_map is None or edge_map is None: return None
     
-    # 1. Uncertainty Mapの前処理
-    # compute_structural_uncertainty の出力(weighted_map)は既に正規化に近い処理がされているが
-    # 安全のためチャンネル平均 -> 正規化を行う
     spatial_unc = torch.mean(uncertainty_map, dim=1, keepdim=True)
     
-    # 2. 正規化関数 (Batchごとに [0, 1])
     def normalize(x):
         b_sz = x.shape[0]
         min_v = x.view(b_sz, -1).min(dim=1, keepdim=True)[0].view(b_sz, 1, 1, 1)
@@ -201,11 +197,8 @@ def create_hybrid_mask(uncertainty_map, edge_map, rate, alpha=0.7, beta=0.3):
     norm_unc = normalize(spatial_unc)
     norm_edge = normalize(edge_map)
 
-    # 3. スコア結合 (Uncertainty優先)
-    # alpha=0.7, beta=0.3 なら、Uncertaintyが支配的になる
     combined_score = alpha * norm_unc + beta * norm_edge
 
-    # 4. マスク生成 (上位 R% を選択)
     b, c, h, w = combined_score.shape
     mask = torch.zeros_like(combined_score)
     for i in range(b):
@@ -216,6 +209,100 @@ def create_hybrid_mask(uncertainty_map, edge_map, rate, alpha=0.7, beta=0.3):
             mask[i] = (combined_score[i] >= threshold).float()
             
     return mask
+
+def create_hybrid_mask_with_dilation(uncertainty_map, edge_map, rate, alpha=0.5, beta=0.5, dilation_kernel=3):
+    """
+    Hybridマスクをさらに膨張(Dilation)させ、幻覚領域をブロックとして修復するマスク
+    """
+    if uncertainty_map is None: return None
+    
+    # 基本のHybridスコア計算 (エッジがない場合はUncertaintyのみ)
+    spatial_unc = torch.mean(uncertainty_map, dim=1, keepdim=True)
+    
+    def normalize(x):
+        b_sz = x.shape[0]
+        min_v = x.view(b_sz, -1).min(dim=1, keepdim=True)[0].view(b_sz, 1, 1, 1)
+        max_v = x.view(b_sz, -1).max(dim=1, keepdim=True)[0].view(b_sz, 1, 1, 1)
+        return (x - min_v) / (max_v - min_v + 1e-8)
+
+    norm_unc = normalize(spatial_unc)
+    
+    if edge_map is not None:
+        norm_edge = normalize(edge_map)
+        combined_score = alpha * norm_unc + beta * norm_edge
+    else:
+        combined_score = norm_unc
+
+    # Top-Kでバイナリマスク作成
+    b, c, h, w = combined_score.shape
+    binary_mask = torch.zeros_like(combined_score)
+    for i in range(b):
+        flat = combined_score[i].flatten()
+        k = int(flat.numel() * rate)
+        if k > 0:
+            threshold = torch.kthvalue(flat, flat.numel() - k + 1).values
+            binary_mask[i] = (combined_score[i] >= threshold).float()
+
+    # Dilation (膨張) 処理
+    if dilation_kernel > 1:
+        padding = (dilation_kernel - 1) // 2
+        kernel = torch.ones((1, 1, dilation_kernel, dilation_kernel), device=binary_mask.device)
+        dilated_mask = F.conv2d(binary_mask, kernel, padding=padding)
+        final_mask = (dilated_mask > 0).float()
+        # 注意: 膨張により指定したrateを超える可能性がありますが、
+        # 幻覚防止の観点からは構造的まとまりが重要であるため許容します。
+        # 厳密なレート制御が必要な場合は、スコア自体をMaxPoolingしてからTopKをとる手法もあります。
+    else:
+        final_mask = binary_mask
+
+    return final_mask
+
+def create_semantic_weighted_mask(uncertainty_map, parsing_map, retransmission_rate):
+    """
+    パーツ重要度に基づく重み付けマスク (幻覚防止・ID維持用)
+    """
+    # 1. Latent空間のサイズを取得
+    if uncertainty_map.ndim == 3:
+        u_map_latent = np.mean(uncertainty_map, axis=0)
+    else:
+        u_map_latent = uncertainty_map
+        
+    h_lat, w_lat = u_map_latent.shape
+
+    # 2. セグメンテーションマップをLatentサイズにリサイズ (NN)
+    parsing_map_latent = cv2.resize(parsing_map, (w_lat, h_lat), interpolation=cv2.INTER_NEAREST)
+
+    # 3. 重要度ウェイト定義 (ID維持・幻覚防止のために目鼻立ちを強くブースト)
+    # 0:bg, 1:skin, 2-3:brows, 4-5:eyes, 10:nose, 11-13:mouth, 17:hair
+    weights = {
+        4: 6.0, 5: 6.0,            # 目 (最優先)
+        2: 5.0, 3: 5.0,            # 眉
+        10: 5.0, 11: 5.0, 12: 5.0, 13: 5.0, # 鼻・口
+        1: 2.0,                    # 肌 (頬の不自然さを防ぐ)
+        17: 0.8,                   # 髪 (ノイズが高くなりがちなので抑制)
+        0: 0.1                     # 背景 (ほぼ無視)
+    }
+    default_weight = 0.5
+
+    weight_map = np.full_like(u_map_latent, default_weight)
+    for cls_id, w in weights.items():
+        weight_map[parsing_map_latent == cls_id] = w
+        
+    # 4. スコア計算 (Uncertainty * Weight)
+    weighted_score = u_map_latent * weight_map
+    
+    # 5. 上位R%を選抜
+    flat_scores = weighted_score.flatten()
+    k = int(flat_scores.size * retransmission_rate)
+    
+    final_mask = np.zeros_like(u_map_latent, dtype=np.float32)
+    if k > 0:
+        threshold_idx = flat_scores.size - k
+        # 高速な閾値探索
+        threshold = np.partition(flat_scores, threshold_idx)[threshold_idx]
+        final_mask = (weighted_score >= threshold).astype(np.float32)
+        
+    return final_mask
 
 def create_random_mask(shape, rate, device):
     b, c, h, w = shape
@@ -231,7 +318,6 @@ def create_random_mask(shape, rate, device):
 
 def save_mask_tensor(mask, batch_files, batch_out_dir, prefix):
     """マスク画像を保存するヘルパー関数"""
-    # mask: [B, 1, H, W]
     for j, fname in enumerate(batch_files):
         m = mask[j, 0].cpu().numpy()
         m_img = (m * 255).astype(np.uint8)
@@ -260,7 +346,7 @@ def evaluate_and_save(x_rec, batch_input, batch_files, batch_out_dir, suffix,
     return results
 
 def main():
-    parser = argparse.ArgumentParser(description="DiffCom Retransmission Simulation with Hybrid Mask")
+    parser = argparse.ArgumentParser(description="DiffCom Retransmission Simulation with Semantic Weighting & Dilation")
     parser.add_argument("--input_dir", type=str, default="input_dir")
     parser.add_argument("--output_dir", type=str, default="results/")
     parser.add_argument("--snr", type=float, default=-15.0)
@@ -273,38 +359,90 @@ def main():
     parser.add_argument("--struct_alpha", type=float, default=0.3)
     parser.add_argument("--hybrid_alpha", type=float, default=0.7, help="Weight for Uncertainty in Hybrid mask")
     parser.add_argument("--hybrid_beta", type=float, default=0.3, help="Weight for Edge in Hybrid mask")
+    parser.add_argument("--dilation_kernel", type=int, default=3, help="Kernel size for Hybrid Dilation")
     parser.add_argument("--seed", type=int, default=42)
+    
+    # --- 手法選択用の引数 ---
+    # hybrid_dilated を追加
+    available_methods = ["structural", "raw", "wacv", "semantic", "random", "edge_rec", "edge_gt", "hybrid", "hybrid_dilated"]
+    parser.add_argument("--target_methods", nargs='+', default=["all"], 
+                        help=f"Select methods to run. Options: {', '.join(available_methods)} or 'all'.")
+    
     args = parser.parse_args()
 
+    # --- 実行する手法の特定 ---
+    method_name_map = {
+        "structural": "pass2_structural",
+        "raw": "pass2_raw",
+        "wacv": "pass2_wacv",
+        "semantic": "pass2_semantic",
+        "random": "pass2_random",
+        "edge_rec": "pass2_edge_rec",
+        "edge_gt": "pass2_edge_gt",
+        "hybrid": "pass2_hybrid",
+        "hybrid_dilated": "pass2_hybrid_dilated" # 追加
+    }
+
+    if "all" in args.target_methods:
+        target_keys = set(method_name_map.values())
+    else:
+        target_keys = set()
+        for m in args.target_methods:
+            if m in method_name_map:
+                target_keys.add(method_name_map[m])
+            else:
+                print(f"Warning: Unknown method '{m}' ignored.")
+    
+    print(f"Target Methods: {sorted(list(target_keys))}")
+
+    # 初期シード設定
     set_seed(args.seed)
+    
     config = OmegaConf.load(args.config)
     model = load_model_from_config(config, args.ckpt)
     sampler = DDIMSampler(model)
 
-    face_parser = FaceParser(args.face_model_path, device='cuda') if FACE_PARSING_AVAILABLE and os.path.exists(args.face_model_path) else None
+    # FaceParserはsemanticが選択されているときのみロード
+    use_semantic = "pass2_semantic" in target_keys
+    face_parser = None
+    if use_semantic:
+        if FACE_PARSING_AVAILABLE and os.path.exists(args.face_model_path):
+            print(f"Loading FaceParser for semantic weighting...")
+            face_parser = FaceParser(args.face_model_path, device='cuda')
+        else:
+            print("Warning: Semantic method selected but dependencies missing. Skipping.")
+            target_keys.discard("pass2_semantic")
+
     loss_fn_lpips = lpips.LPIPS(net='alex').cuda().eval() if LPIPS_AVAILABLE else None
     loss_fn_dists = DISTS().cuda().eval() if DISTS_AVAILABLE else None
     loss_fn_id = InceptionResnetV1(pretrained='vggface2').cuda().eval() if IDLOSS_AVAILABLE else None
 
     image_files = sorted([f for f in os.listdir(args.input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-    experiment_dir = os.path.join(args.output_dir, f"snr{args.snr}dB_rate{args.retransmission_rate}_alpha{args.struct_alpha}_h{args.hybrid_alpha}-{args.hybrid_beta}")
+    experiment_dir = os.path.join(args.output_dir, f"snr{args.snr}dB_rate{args.retransmission_rate}_alpha{args.struct_alpha}")
     os.makedirs(experiment_dir, exist_ok=True)
     fid_root = os.path.join(experiment_dir, "fid_images")
     
-    # 評価対象のメソッド一覧 (Hybridを追加)
-    eval_keys = ["gt", "pass1", "pass2_structural", "pass2_raw", "pass2_wacv", "pass2_semantic", "pass2_random", "pass2_edge_rec", "pass2_edge_gt", "pass2_hybrid"]
+    eval_keys = ["gt", "pass1"] + sorted(list(target_keys))
     fid_dirs = {k: os.path.join(fid_root, k) for k in eval_keys}
     if FID_AVAILABLE: [os.makedirs(d, exist_ok=True) for d in fid_dirs.values()]
     
     all_results = {}
     json_path = os.path.join(experiment_dir, f"metrics.json")
+    calc_wacv = "pass2_wacv" in target_keys
 
     try:
         with torch.no_grad():
             for i in range(0, len(image_files), args.batch_size):
+                # =========================================================
+                # バッチごとのシード制御
+                # =========================================================
+                batch_idx = i // args.batch_size
+                current_batch_seed = args.seed + batch_idx
+                set_seed(current_batch_seed)
+                # =========================================================
+
                 batch_files = image_files[i : i + args.batch_size]
                 actual_bs = len(batch_files)
-                batch_idx = i // args.batch_size
                 batch_out_dir = os.path.join(experiment_dir, f"batch{batch_idx}")
                 os.makedirs(batch_out_dir, exist_ok=True)
 
@@ -328,9 +466,7 @@ def main():
                 z0 = z0.mode() if not isinstance(z0, torch.Tensor) else z0
                 z_received_pass1 = add_awgn_channel(z0, args.snr)
 
-                # =================================================================
-                # Pass 1: WACVの不確実性(calc_wacv_uncertainty=True)を有効化
-                # =================================================================
+                # Pass 1 Sampling
                 samples_pass1, history_pass1 = sampler.sample_awgn(
                     S=args.ddim_steps, 
                     batch_size=args.batch_size, 
@@ -338,19 +474,15 @@ def main():
                     noisy_latent=z_received_pass1, 
                     snr_db=args.snr, 
                     eta=0.0,
-                    calc_wacv_uncertainty=True  # WACV手法のためにTrueにする
+                    calc_wacv_uncertainty=calc_wacv
                 )
                 
-                # 不確実性マップ抽出
                 temporal_uncertainty_map = None
                 wacv_uncertainty_map = None
-                
                 if history_pass1:
                     for h_name, h_map in history_pass1:
-                        if h_name == "temporal":
-                            temporal_uncertainty_map = h_map
-                        elif h_name == "wacv":
-                            wacv_uncertainty_map = h_map
+                        if h_name == "temporal": temporal_uncertainty_map = h_map
+                        elif h_name == "wacv": wacv_uncertainty_map = h_map
                 
                 uncertainty_map_for_sem = temporal_uncertainty_map
 
@@ -358,118 +490,157 @@ def main():
                 pass1_results = evaluate_and_save(x_rec_pass1[:actual_bs], valid_batch_input, batch_files, batch_out_dir, "pass1", loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs["pass1"] if FID_AVAILABLE else None)
 
                 # === エッジマップ計算 ===
-                edge_map_rec = compute_edge_map(x_rec_pass1, (z0.shape[2], z0.shape[3]))
-                edge_map_gt = compute_edge_map(batch_input, (z0.shape[2], z0.shape[3]))
+                need_edge = any(k in target_keys for k in ["pass2_edge_rec", "pass2_hybrid", "pass2_hybrid_dilated"])
+                need_edge_gt = any(k in target_keys for k in ["pass2_edge_gt", "pass2_hybrid", "pass2_hybrid_dilated"])
+                
+                edge_map_rec = None
+                if need_edge:
+                    edge_map_rec = compute_edge_map(x_rec_pass1, (z0.shape[2], z0.shape[3]))
+                
+                edge_map_gt = None
+                if need_edge_gt:
+                    edge_map_gt = compute_edge_map(batch_input, (z0.shape[2], z0.shape[3]))
 
-                # === Structural Uncertainty Map (Pass 2 StructuralとHybridで共用) ===
-                map_struct = compute_structural_uncertainty(temporal_uncertainty_map, samples_pass1, alpha=args.struct_alpha)
+                # === Structural Uncertainty Map ===
+                need_struct = any(k in target_keys for k in ["pass2_structural", "pass2_hybrid", "pass2_hybrid_dilated"])
+                map_struct = None
+                if need_struct:
+                    map_struct = compute_structural_uncertainty(temporal_uncertainty_map, samples_pass1, alpha=args.struct_alpha)
 
                 # =================================================================
                 # Pass 2 Methods Definition
                 # =================================================================
-                methods = [
-                    # 既存: Temporal Variance (Struct & Raw)
+                method_candidates = [
                     ("pass2_structural", lambda: create_retransmission_mask(map_struct, args.retransmission_rate)),
                     ("pass2_raw", lambda: create_retransmission_mask(temporal_uncertainty_map, args.retransmission_rate)),
-                    
-                    # 新規: WACV (Score Variance)
                     ("pass2_wacv", lambda: create_retransmission_mask(wacv_uncertainty_map, args.retransmission_rate)),
-                    
-                    # 既存: Edge
                     ("pass2_edge_rec", lambda: create_retransmission_mask(edge_map_rec, args.retransmission_rate)),
                     ("pass2_edge_gt", lambda: create_retransmission_mask(edge_map_gt, args.retransmission_rate)),
-
-                    # ★新規提案: Hybrid (Uncertainty + Edge/GT)
-                    ("pass2_hybrid", lambda: create_hybrid_mask(map_struct, edge_map_gt, args.retransmission_rate, args.hybrid_alpha, args.hybrid_beta))
+                    ("pass2_hybrid", lambda: create_hybrid_mask(map_struct, edge_map_gt, args.retransmission_rate, args.hybrid_alpha, args.hybrid_beta)),
+                    # 追加: 膨張版Hybrid
+                    ("pass2_hybrid_dilated", lambda: create_hybrid_mask_with_dilation(map_struct, edge_map_gt, args.retransmission_rate, args.hybrid_alpha, args.hybrid_beta, args.dilation_kernel))
                 ]
                 
+                active_methods = [m for m in method_candidates if m[0] in target_keys]
+
                 results_batch = {"pass1": pass1_results}
-                for key, mask_gen in methods:
+                
+                # 通常メソッドの実行
+                for key, mask_gen in active_methods:
                     if args.retransmission_rate > 0.0:
+                        set_seed(current_batch_seed + 1000)
                         mask = mask_gen()
-                        # マスクが生成できない場合（マップがNone等）はスキップ
                         if mask is None: continue
                         
                         save_mask_tensor(mask, batch_files, batch_out_dir, f"mask_{key.replace('pass2_', '')}")
                         s, _ = sampler.sample_inpainting_awgn(S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:], noisy_latent=z_received_pass1, snr_db=args.snr, mask=mask, x0=z0, eta=0.0)
                         results_batch[key] = evaluate_and_save(model.decode_first_stage(s)[:actual_bs], valid_batch_input, batch_files, batch_out_dir, key, loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs[key] if FID_AVAILABLE else None)
 
-                # Semantic
-                if args.retransmission_rate > 0.0 and uncertainty_map_for_sem is not None and face_parser:
+                # =================================================================
+                # Semantic Weighted Method (アップグレード版)
+                # =================================================================
+                if "pass2_semantic" in target_keys and args.retransmission_rate > 0.0 and uncertainty_map_for_sem is not None and face_parser:
+                    set_seed(current_batch_seed + 1000)
+                    
                     mask_sem_list = []
                     for j in range(actual_bs):
                         p = face_parser.get_parsing_map(x_rec_pass1[j:j+1])
-                        m = torch.from_numpy(create_semantic_uncertainty_mask(uncertainty_map_for_sem[j].cpu().numpy().squeeze(), p, args.retransmission_rate)).unsqueeze(0).unsqueeze(0).float()
+                        # ★ここを変更: 新しい重み付け関数を使用
+                        # create_semantic_weighted_mask は numpy array を返すので tensor に変換
+                        m_np = create_semantic_weighted_mask(
+                            uncertainty_map_for_sem[j].cpu().numpy().squeeze(), 
+                            p, 
+                            args.retransmission_rate
+                        )
+                        m = torch.from_numpy(m_np).unsqueeze(0).unsqueeze(0).float()
                         mask_sem_list.append(m)
+                    
                     mask_sem = torch.cat(mask_sem_list, dim=0)
-                    save_mask_tensor(mask_sem, batch_files, batch_out_dir, "mask_semantic")
-                    mask_sem_p = torch.cat([mask_sem, mask_sem[-1:].repeat(args.batch_size-actual_bs, 1, 1, 1)], dim=0).cuda()
+                    save_mask_tensor(mask_sem, batch_files, batch_out_dir, "mask_semantic_weighted")
+                    
+                    # Batchサイズ調整
+                    mask_sem_p = mask_sem
+                    if mask_sem.shape[0] < args.batch_size:
+                        mask_sem_p = torch.cat([mask_sem, mask_sem[-1:].repeat(args.batch_size-actual_bs, 1, 1, 1)], dim=0)
+                    mask_sem_p = mask_sem_p.cuda()
+                        
                     s, _ = sampler.sample_inpainting_awgn(S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:], noisy_latent=z_received_pass1, snr_db=args.snr, mask=mask_sem_p, x0=z0, eta=0.0)
                     results_batch["pass2_semantic"] = evaluate_and_save(model.decode_first_stage(s)[:actual_bs], valid_batch_input, batch_files, batch_out_dir, "pass2_semantic", loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs["pass2_semantic"] if FID_AVAILABLE else None)
 
-                # Random
-                if args.retransmission_rate > 0.0:
+                # Random (Comparison)
+                if "pass2_random" in target_keys and args.retransmission_rate > 0.0:
+                    set_seed(current_batch_seed + 1000)
                     mask_r = create_random_mask((z0.shape[0], 1, z0.shape[2], z0.shape[3]), args.retransmission_rate, z0.device)
                     save_mask_tensor(mask_r, batch_files, batch_out_dir, "mask_rand")
                     s, _ = sampler.sample_inpainting_awgn(S=args.ddim_steps, batch_size=args.batch_size, shape=z0.shape[1:], noisy_latent=z_received_pass1, snr_db=args.snr, mask=mask_r, x0=z0, eta=0.0)
                     results_batch["pass2_random"] = evaluate_and_save(model.decode_first_stage(s)[:actual_bs], valid_batch_input, batch_files, batch_out_dir, "pass2_random", loss_fn_lpips, loss_fn_dists, loss_fn_id, fid_dirs["pass2_random"] if FID_AVAILABLE else None)
 
                 # 結果格納
-                # 評価メソッドに pass2_hybrid を追加
-                eval_methods = ["pass1", "pass2_structural", "pass2_raw", "pass2_wacv", "pass2_semantic", "pass2_random", "pass2_edge_rec", "pass2_edge_gt", "pass2_hybrid"]
                 for f in batch_files:
-                    all_results[f] = {k: {"metrics": results_batch[k].get(f)} for k in eval_methods if results_batch.get(k)}
+                    all_results[f] = {k: {"metrics": results_batch[k].get(f)} for k in results_batch.keys() if results_batch.get(k)}
                 gc.collect(); torch.cuda.empty_cache()
 
-        # Summary & Highlighting
+        # Summary
         method_labels = {
             "pass1": "Pass 1 (Initial)", 
             "pass2_structural": "Pass 2 (Struct/Smooth)", 
             "pass2_raw": "Pass 2 (Raw/Temporal)", 
             "pass2_wacv": "Pass 2 (WACV/ScoreVar)",
-            "pass2_semantic": "Pass 2 (Semantic/Face)", 
+            "pass2_semantic": "Pass 2 (Semantic/Weighted)", # Label変更: Weightedであることを明示
             "pass2_random": "Pass 2 (Random)",
             "pass2_edge_rec": "Pass 2 (Edge/Rec)",
             "pass2_edge_gt": "Pass 2 (Edge/GT-Oracle)",
-            "pass2_hybrid": "Pass 2 (Hybrid U+E)" # Label Added
+            "pass2_hybrid": "Pass 2 (Hybrid U+E)",
+            "pass2_hybrid_dilated": "Pass 2 (Hybrid/Dilated)" # 追加
         }
         
+        executed_methods = [m for m in method_labels.keys() if m == "pass1" or m in target_keys]
+
         metric_keys = ["psnr", "lpips", "dists", "id_loss"]
-        averages = {m: {met: np.mean([all_results[f][m]["metrics"][met] for f in all_results if all_results[f].get(m) and all_results[f][m].get("metrics")]) for met in metric_keys} for m in method_labels}
+        averages = {m: {met: np.mean([all_results[f][m]["metrics"][met] for f in all_results if all_results[f].get(m) and all_results[f][m].get("metrics")]) for met in metric_keys} for m in executed_methods}
         
         fids = {}
         if FID_AVAILABLE:
-            for m in method_labels.keys():
+            for m in executed_methods:
                 if m in fid_dirs and os.path.exists(fid_dirs[m]) and len(os.listdir(fid_dirs[m])) > 0:
                     try:
                         fids[m] = fid_score.calculate_fid_given_paths([fid_dirs["gt"], fid_dirs[m]], 50, 'cuda', 2048)
                     except Exception as e:
-                        print(f"FID calc failed for {m}: {e}")
                         fids[m] = None
                 else:
                     fids[m] = None
 
-        best_scores = {met: (max if met == "psnr" else min)([averages[m][met] for m in method_labels if not np.isnan(averages[m][met])]) for met in metric_keys}
+        best_scores = {}
+        for met in metric_keys:
+             valid_values = [averages[m][met] for m in executed_methods if m in averages and not np.isnan(averages[m][met])]
+             if valid_values:
+                 best_scores[met] = (max if met == "psnr" else min)(valid_values)
+             else:
+                 best_scores[met] = -1
+
         valid_fids = [v for v in fids.values() if v is not None]
         best_fid = min(valid_fids) if valid_fids else None
 
         GREEN, BOLD, RESET = "\033[92m", "\033[1m", "\033[0m"
-        print("\n" + "="*110 + f"\n  SUMMARY (N={len(all_results)})\n" + "="*110)
+        print("\n" + "="*120 + f"\n  SUMMARY (N={len(all_results)})\n" + "="*120)
         print(f"{'Method':<30} | {'PSNR':<10} | {'LPIPS':<10} | {'DISTS':<10} | {'ID Loss':<10} | {'FID':<10}")
-        print("-" * 110)
-        for m, name in method_labels.items():
+        print("-" * 120)
+        for m in executed_methods:
+            name = method_labels[m]
             if m not in averages: continue
             row = f"{name:<30}"
             for met in metric_keys:
                 val = averages[m][met]
                 s = f"{val:.4f}"
-                row += f" | {GREEN}{BOLD}*{s}*{RESET}" if abs(val - best_scores[met]) < 1e-7 else f" | {s:<10}"
+                is_best = abs(val - best_scores[met]) < 1e-7 if best_scores[met] != -1 else False
+                row += f" | {GREEN}{BOLD}*{s}*{RESET}" if is_best else f" | {s:<10}"
             f_val = fids.get(m)
             if f_val is not None:
                 row += f" | {GREEN}{BOLD}*{f_val:.4f}*{RESET}" if best_fid and abs(f_val - best_fid) < 1e-7 else f" | {f_val:.4f}  "
             else: row += f" | {'N/A':<10}"
             print(row)
-        print("-" * 110)
+        print("-" * 120)
         with open(json_path, 'w') as f: json.dump({"summary": {"averages": averages, "fid": fids}}, f, indent=4)
     except Exception as e: print(f"Error: {e}"); raise e
+
 if __name__ == "__main__": main()

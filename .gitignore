@@ -12,3 +12,5 @@ models/face_parsing/79999_iter.pth
 results_experiment
 results*
 log*
+RCS
+*.pdf
